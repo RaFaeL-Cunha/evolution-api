@@ -116,26 +116,23 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       logger.verbose(
         `Saving: remoteJid=${remoteJid}, jidOptions=${uniqueNumbers.join(',')}, lid=${item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null}`,
       );
+        
+      await prismaRepository.isOnWhatsapp.upsert({
+        where: { remoteJid: remoteJid }, // Prisma tenta encontrar o registro aqui
 
-      if (existingRecord) {
-        await prismaRepository.isOnWhatsapp.update({
-          where: { id: existingRecord.id },
-          data: {
-            remoteJid: remoteJid,
-            jidOptions: uniqueNumbers.join(','),
-            lid: item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null,
-          },
-        });
-      } else {
-        await prismaRepository.isOnWhatsapp.create({
-          data: {
-            remoteJid: remoteJid,
-            jidOptions: uniqueNumbers.join(','),
-            lid: item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null,
-          },
-        });
-      }
-    }
+        update: {
+          // Campos de update
+        jidOptions: uniqueNumbers.join(','),
+        lid: item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null,
+    }, // Se encontrar, ele atualiza
+      create: {
+    // Campos de criação
+      remoteJid: remoteJid,
+      jidOptions: uniqueNumbers.join(','),
+      lid: item.lid === 'lid' || item.remoteJid?.includes('@lid') ? 'lid' : null,
+    }, // Se NÃO encontrar, ele cria
+    });
+  }
   }
 }
 

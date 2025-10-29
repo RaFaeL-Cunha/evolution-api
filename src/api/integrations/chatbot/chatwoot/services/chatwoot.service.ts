@@ -53,7 +53,7 @@ export class ChatwootService {
     private readonly configService: ConfigService,
     private readonly prismaRepository: PrismaRepository,
     private readonly cache: CacheService,
-  ) {}
+  ) { }
 
   private pgClient = postgresClient.getChatwootConnection();
 
@@ -720,8 +720,8 @@ export class ChatwootService {
               contact.name === chatId ||
               (`+${chatId}`.startsWith('+55')
                 ? this.getNumbers(`+${chatId}`).some(
-                    (v) => contact.name === v || contact.name === v.substring(3) || contact.name === v.substring(1),
-                  )
+                  (v) => contact.name === v || contact.name === v.substring(3) || contact.name === v.substring(1),
+                )
                 : false);
             this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
             this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
@@ -1288,10 +1288,10 @@ export class ChatwootService {
       // Chatwoot to Whatsapp
       const messageReceived = body.content
         ? body.content
-            .replaceAll(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // Substitui * por _
-            .replaceAll(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // Substitui ** por *
-            .replaceAll(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // Substitui ~~ por ~
-            .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```') // Substitui ` por ```
+          .replaceAll(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // Substitui * por _
+          .replaceAll(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // Substitui ** por *
+          .replaceAll(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // Substitui ~~ por ~
+          .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```') // Substitui ` por ```
         : body.content;
 
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
@@ -1953,9 +1953,9 @@ export class ChatwootService {
         const originalMessage = await this.getConversationMessage(body.message);
         const bodyMessage = originalMessage
           ? originalMessage
-              .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
-              .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
-              .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
+            .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
+            .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
+            .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~')
           : originalMessage;
 
         if (bodyMessage && bodyMessage.includes('/survey/responses/') && bodyMessage.includes('http')) {
@@ -2024,7 +2024,7 @@ export class ChatwootService {
           const fileData = Buffer.from(downloadBase64.base64, 'base64');
 
           const fileStream = new Readable();
-          fileStream._read = () => {};
+          fileStream._read = () => { };
           fileStream.push(fileData);
           fileStream.push(null);
 
@@ -2142,7 +2142,7 @@ export class ChatwootService {
           const processedBuffer = await img.getBuffer(JimpMime.png);
 
           const fileStream = new Readable();
-          fileStream._read = () => {}; // _read is required but you can noop it
+          fileStream._read = () => { }; // _read is required but you can noop it
           fileStream.push(processedBuffer);
           fileStream.push(null);
 
@@ -2237,56 +2237,103 @@ export class ChatwootService {
           return send;
         }
       }
-
+      //  DELETE 
+      // Hard delete quando habilitado; senão cria placeholder "apagada pelo remetente"
       if (event === Events.MESSAGES_DELETE) {
+        // Anti-dup local (process-wide) por 15s
+        const dedupKey = `cw_del_${instance.instanceId}_${body?.key?.id}`;
+        const g = (global as any);
+        if (!g.__cwDel) g.__cwDel = new Map<string, number>();
+        const last = g.__cwDel.get(dedupKey);
+        const now = Date.now();
+        if (last && now - last < 15000) {
+          this.logger.info(`[CW.DELETE] Ignorado (duplicado local) para ${body?.key?.id}`);
+          return;
+        }
+        g.__cwDel.set(dedupKey, now);
+
         const chatwootDelete = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_DELETE;
 
-        if (chatwootDelete === true) {
-          if (!body?.key?.id) {
-            this.logger.warn('message id not found');
-            return;
+        if (!body?.key?.id) {
+          this.logger.warn('message id not found');
+          return;
+        }
+
+        const message = await this.getMessageByKeyId(instance, body.key.id);
+        if (!message) {
+          this.logger.warn('Message not found for delete event');
+          return;
+        }
+
+        if (chatwootDelete === true && message?.chatwootMessageId && message?.chatwootConversationId) {
+          await this.prismaRepository.message.deleteMany({
+            where: {
+              key: { path: ['id'], equals: body.key.id },
+              instanceId: instance.instanceId,
+            },
+          });
+
+          await client.messages.delete({
+            accountId: this.provider.accountId,
+            conversationId: message.chatwootConversationId,
+            messageId: message.chatwootMessageId,
+          });
+          return; // hard delete
+        } else {
+          const key = message.key as WAMessageKey;
+          const messageType = key?.fromMe ? 'outgoing' : 'incoming';
+          const DELETE_PLACEHOLDER = '🗑️ Mensagem apagada pelo remetente';
+
+          if (message.chatwootConversationId) {
+            const send = await this.createMessage(
+              instance,
+              message.chatwootConversationId,
+              DELETE_PLACEHOLDER,
+              messageType,
+              false,
+              [],
+              { message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } } },
+              'DEL:' + body.key.id, // mantém a intenção de idempotência
+              null,
+            );
+            if (!send) this.logger.warn('delete placeholder not sent');
           }
-
-          const message = await this.getMessageByKeyId(instance, body.key.id);
-
-          if (message?.chatwootMessageId && message?.chatwootConversationId) {
-            await this.prismaRepository.message.deleteMany({
-              where: {
-                key: {
-                  path: ['id'],
-                  equals: body.key.id,
-                },
-                instanceId: instance.instanceId,
-              },
-            });
-
-            return await client.messages.delete({
-              accountId: this.provider.accountId,
-              conversationId: message.chatwootConversationId,
-              messageId: message.chatwootMessageId,
-            });
-          }
+          return;
         }
       }
 
+      //  EDIT 
+      // Cria "Mensagem editada: <texto>" SOMENTE se houver texto (evita 'undefined')
+      // Se vier "edit" sem texto (REVOKE mascarado), não faz nada aqui — o bloco de DELETE trata.
       if (event === 'messages.edit' || event === 'send.message.update') {
-        const editedMessageContent =
-          body?.editedMessage?.conversation || body?.editedMessage?.extendedTextMessage?.text;
-        const message = await this.getMessageByKeyId(instance, body?.key?.id);
+        const editedMessageContentRaw =
+          body?.editedMessage?.conversation ??
+          body?.editedMessage?.extendedTextMessage?.text ??
+          body?.editedMessage?.imageMessage?.caption ??
+          body?.editedMessage?.videoMessage?.caption ??
+          body?.editedMessage?.documentMessage?.caption ??
+          (typeof body?.text === 'string' ? body.text : undefined);
 
+        const editedMessageContent = (editedMessageContentRaw ?? '').trim();
+
+        // Sem conteúdo? Ignora aqui. O DELETE vai gerar o placeholder se for o caso.
+        if (!editedMessageContent) {
+          this.logger.info('[CW.EDIT] Conteúdo vazio — ignorando (DELETE tratará se for revoke).');
+          return;
+        }
+
+        const message = await this.getMessageByKeyId(instance, body?.key?.id);
         if (!message) {
           this.logger.warn('Message not found for edit event');
           return;
         }
 
         const key = message.key as WAMessageKey;
-
         const messageType = key?.fromMe ? 'outgoing' : 'incoming';
 
-        if (message && message.chatwootConversationId && message.chatwootMessageId) {
-          // Criar nova mensagem com formato: "Mensagem editada:\n\nteste1"
-          const editedText = `\n\n\`${i18next.t('cw.message.edited')}:\`\n\n${editedMessageContent}`;
-
+        if (message.chatwootConversationId) {
+          const label = `\`${i18next.t('cw.message.edited')}\``; // "Mensagem editada"
+          const editedText = `${label}:${editedMessageContent}`;
           const send = await this.createMessage(
             instance,
             message.chatwootConversationId,
@@ -2294,19 +2341,16 @@ export class ChatwootService {
             messageType,
             false,
             [],
-            {
-              message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } },
-            },
+            { message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } } },
             'WAID:' + body.key.id,
             null,
           );
-          if (!send) {
-            this.logger.warn('edited message not sent');
-            return;
-          }
+          if (!send) this.logger.warn('edited message not sent');
         }
         return;
       }
+
+      // FIM DA EDIÇÃO
 
       if (event === 'messages.read') {
         if (!body?.key?.id || !body?.key?.remoteJid) {
@@ -2399,7 +2443,7 @@ export class ChatwootService {
           const fileData = Buffer.from(body?.qrcode.base64.replace('data:image/png;base64,', ''), 'base64');
 
           const fileStream = new Readable();
-          fileStream._read = () => {};
+          fileStream._read = () => { };
           fileStream.push(fileData);
           fileStream.push(null);
 
