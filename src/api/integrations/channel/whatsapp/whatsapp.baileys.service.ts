@@ -695,7 +695,7 @@ export class BaileysStartupService extends ChannelStartupService {
             username: this.localProxy.username,
             password: this.localProxy.password,
           }),
-          fetchAgent: makeProxyAgent({
+          fetchAgent: makeProxyAgentUndici({
             host: this.localProxy.host,
             port: this.localProxy.port,
             protocol: this.localProxy.protocol,
