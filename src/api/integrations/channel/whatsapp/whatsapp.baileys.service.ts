@@ -59,12 +59,7 @@ import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { chatbotController, waMonitor } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
-import {
-  Events,
-  MessageSubtype,
-  TypeMediaMessage,
-  wa,
-} from '@api/types/wa.types';
+import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
 import {
   AudioConverter,
@@ -80,22 +75,15 @@ import {
   QrCode,
   S3,
 } from '@config/env.config';
-import {
-  BadRequestException,
-  InternalServerErrorException,
-  NotFoundException,
-} from '@exceptions';
+import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import { makeProxyAgent } from '@utils/makeProxyAgent';
-import {
-  getOnWhatsappCache,
-  saveOnWhatsappCache,
-} from '@utils/onWhatsappCache';
+import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
+import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -171,9 +159,7 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
   isViewOnce?: boolean;
 }
 
-const groupMetadataCache = new CacheService(
-  new CacheEngine(configService, 'groups').getEngine()
-);
+const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(
@@ -654,14 +640,6 @@ export class BaileysStartupService extends ChannelStartupService {
     const version = baileysVersion.version;
     const log = `Baileys version: ${version.join('.')}`;
 
-    // if (session.VERSION) {
-    //   version = session.VERSION.split('.');
-    //   log = `Baileys version env: ${version}`;
-    // } else {
-    //   const baileysVersion = await fetchLatestWaWebVersion({});
-    //   version = baileysVersion.version;
-    //   log = `Baileys version: ${version}`;
-    // }
 
     this.logger.info(log);
 
@@ -1478,7 +1456,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           // antes: if (cached && !editedMessage && !requestId) {
           if (cached && !isEditOrDelete && !requestId) {
-            this.logger.info(`Message duplicated ignored: ${received.key.id}`);
+            this.logger.info(`Update Message duplicated ignored: ${received.key.id}`);
             continue;
           }
           //await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS); comentei aqui by rafael
