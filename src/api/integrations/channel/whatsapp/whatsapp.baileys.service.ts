@@ -4838,9 +4838,7 @@ export class BaileysStartupService extends ChannelStartupService {
       } else if (isBase64(picture)) {
         pic = Buffer.from(picture, 'base64');
       } else {
-        throw new BadRequestException(
-          ''profilePicture' must be a url or a base64'
-        );
+        throw new BadRequestException('"profilePicture" must be a url or a base64');
       }
 
       await this.client.updateProfilePicture(this.instance.wuid, pic);
@@ -5199,9 +5197,7 @@ export class BaileysStartupService extends ChannelStartupService {
       } else if (isBase64(picture.image)) {
         pic = Buffer.from(picture.image, 'base64');
       } else {
-        throw new BadRequestException(
-          ''profilePicture' must be a url or a base64'
-        );
+        throw new BadRequestException('"profilePicture" must be a url or a base64');
       }
       await this.client.updateProfilePicture(picture.groupJid, pic);
 

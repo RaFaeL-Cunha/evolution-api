@@ -1385,11 +1385,10 @@ export class ChatwootService {
       }
 
       if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
-        if (
-          if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
+        if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
 
-            return { message: 'bot' };
-          }
+          return { message: 'bot' };
+        }
 
         if (!waInstance && body.conversation?.id) {
           this.onSendMessageError(instance, body.conversation?.id, 'Instance not found');
@@ -2216,17 +2215,23 @@ export class ChatwootService {
       //  DELETE 
       // Hard delete quando habilitado; senão cria placeholder "apagada pelo remetente"
       if (event === Events.MESSAGES_DELETE) {
-        // Anti-dup local (process-wide) por 15s
+        // Anti-dup distribuído (multi-process) por 15s
+        const DEDUP_TTL = 15; // 15 segundos
         const dedupKey = `cw_del_${instance.instanceId}_${body?.key?.id}`;
-        const g = (global as any);
-        if (!g.__cwDel) g.__cwDel = new Map<string, number>();
-        const last = g.__cwDel.get(dedupKey);
-        const now = Date.now();
-        if (last && now - last < 15000) {
-          this.logger.info(`[CW.DELETE] Ignorado (duplicado local) para ${body?.key?.id}`);
+
+
+        // Verifica se a chave já existe no cache distribuído.
+        const seen = await this.cache.get(dedupKey);
+
+        if (seen) {
+          this.logger.info(`[CW.DELETE] Ignorado (duplicado distribuído) para ${body?.key?.id}`);
           return;
         }
-        g.__cwDel.set(dedupKey, now);
+
+        // Marca no cache. Usa apenas o TTL numérico, conforme esperado pelo seu CacheService.
+        await this.cache.set(dedupKey, '1', DEDUP_TTL);
+        // ^^^ Este set retorna 'void' (nada) e não aceita a opção { nx: true }, 
+        //     por isso a verificação if(seen) precisa ser feita antes.
 
         const chatwootDelete = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_DELETE;
 
