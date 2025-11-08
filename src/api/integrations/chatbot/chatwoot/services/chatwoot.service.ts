@@ -2215,23 +2215,21 @@ export class ChatwootService {
       //  DELETE 
       // Hard delete quando habilitado; senão cria placeholder "apagada pelo remetente"
       if (event === Events.MESSAGES_DELETE) {
-        // Anti-dup distribuído (multi-process) por 15s
-        const DEDUP_TTL = 15; // 15 segundos
+        // Anti-dup local (process-wide) por 15s (Otimizado para 1 contêiner)
+
         const dedupKey = `cw_del_${instance.instanceId}_${body?.key?.id}`;
+        const g = (global as any);
+        if (!g.__cwDel) g.__cwDel = new Map<string, number>();
 
+        const last = g.__cwDel.get(dedupKey);
+        const now = Date.now();
 
-        // Verifica se a chave já existe no cache distribuído.
-        const seen = await this.cache.get(dedupKey);
-
-        if (seen) {
-          this.logger.info(`[CW.DELETE] Ignorado (duplicado distribuído) para ${body?.key?.id}`);
+        if (last && now - last < 15000) {
+          this.logger.info(`[CW.DELETE] Ignorado (duplicado local) para ${body?.key?.id}`);
           return;
         }
 
-        // Marca no cache. Usa apenas o TTL numérico, conforme esperado pelo seu CacheService.
-        await this.cache.set(dedupKey, '1', DEDUP_TTL);
-        // ^^^ Este set retorna 'void' (nada) e não aceita a opção { nx: true }, 
-        //     por isso a verificação if(seen) precisa ser feita antes.
+        g.__cwDel.set(dedupKey, now);
 
         const chatwootDelete = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_DELETE;
 
