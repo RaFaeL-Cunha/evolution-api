@@ -1460,6 +1460,24 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
           //await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS); comentei aqui by rafael
+          
+          // Handle empty messages (view once or encrypted content)
+          if (!received?.message && type === 'notify' && !isEditOrDelete) {
+            const isViewOnce = (received.key as ExtendedIMessageKey)?.isViewOnce;
+            
+            if (isViewOnce) {
+              this.logger.info(`[VIEW_ONCE] View once message detected from ${received.key.remoteJid}. Adding placeholder.`);
+              received.message = {
+                conversation: '🔒 *Mensagem de visualização única recebida*\n\nEsta mensagem só pode ser visualizada uma vez no celular. Por segurança, o WhatsApp não permite acesso via API.',
+              };
+            } else {
+              this.logger.info(`[EMPTY_MESSAGE] Empty message detected from ${received.key.remoteJid} - possibly encrypted content. Adding placeholder.`);
+              received.message = {
+                conversation: '⚠️ Mensagem não disponível na API. Pode ser conteúdo criptografado ou erro de sincronização. Verifique no celular.',
+              };
+            }
+          }
+
           if (
             (type !== 'notify' && type !== 'append') ||
             // antes: editedMessage ||

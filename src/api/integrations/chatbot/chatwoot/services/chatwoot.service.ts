@@ -1714,6 +1714,8 @@ export class ChatwootService {
       liveLocationMessage: msg.liveLocationMessage,
       listMessage: msg.listMessage,
       listResponseMessage: msg.listResponseMessage,
+      interactiveMessage: msg.interactiveMessage,
+      pollCreationMessageV3: msg.pollCreationMessageV3,
       viewOnceMessageV2:
         msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
@@ -1731,6 +1733,79 @@ export class ChatwootService {
     // Remove externalAdReplyBody| in Chatwoot (Already Have)
     if (result && typeof result === 'string' && result.includes('externalAdReplyBody|')) {
       result = result.split('externalAdReplyBody|').filter(Boolean).join('');
+    }
+
+    if (typeKey === 'viewOnceMessageV2') {
+      return '🔒 *Mensagem de visualização única*\n\n_Esta mensagem só pode ser visualizada uma vez no celular. Por segurança, o WhatsApp não permite que ela seja acessada pela API._';
+    }
+
+    if (typeKey === 'pollCreationMessageV3') {
+      const pollName = result.name || 'Enquete';
+      const options = result.options || [];
+      const maxSelections = result.selectableOptionsCount || 1;
+      
+      let formattedPoll = `📊 *Enquete: ${pollName}*\n\n`;
+      formattedPoll += `_Opções:_\n`;
+      
+      options.forEach((option, index) => {
+        formattedPoll += `${index + 1}. ${option.optionName}\n`;
+      });
+      
+      // Format selection type in a friendly way
+      let selectionType = '';
+      if (maxSelections === 0) {
+        selectionType = 'Múltipla escolha';
+      } else if (maxSelections === 1) {
+        selectionType = 'Escolha única';
+      } else {
+        selectionType = `Até ${maxSelections} opções`;
+      }
+      
+      formattedPoll += `\n_Tipo:_ ${selectionType}\n`;
+      formattedPoll += `\n_Esta é uma enquete. Visualize no celular para votar._`;
+      
+      return formattedPoll;
+    }
+
+    if (typeKey === 'interactiveMessage') {
+      try {
+        const buttons = result?.nativeFlowMessage?.buttons || result?.buttons || [];
+        
+        // Check if it's a payment message (PIX)
+        for (const button of buttons) {
+          if (button.name === 'payment_info' && button.buttonParamsJson) {
+            const params = JSON.parse(button.buttonParamsJson);
+            const pixSettings = params.payment_settings?.find(s => s.type === 'pix_static_code');
+            
+            if (pixSettings) {
+              const pix = pixSettings.pix_static_code;
+              const amount = params.total_amount?.value / 100 || 0;
+              
+              // Translate key type to Portuguese
+              const keyTypeMap = {
+                'PHONE': 'Celular',
+                'CPF': 'CPF',
+                'CNPJ': 'CNPJ',
+                'EMAIL': 'E-mail',
+                'EVP': 'Chave aleatória'
+              };
+              const keyTypeLabel = keyTypeMap[pix.key_type] || pix.key_type;
+              
+              return `💰 *Pagamento PIX*\n\n` +
+                `_Valor:_ R$ ${amount.toFixed(2)}\n` +
+                `_Beneficiário:_ ${pix.merchant_name}\n` +
+                `_Chave PIX (${keyTypeLabel}):_ ${pix.key}\n` +
+                `_Referência:_ ${params.reference_id}\n\n` +
+                `_Esta é uma solicitação de pagamento. Verifique no celular para pagar._`;
+            }
+          }
+        }
+        
+        // Generic interactive message
+        return '📱 *Mensagem interativa*\n\n_Esta mensagem contém botões ou elementos interativos. Visualize no celular para interagir._';
+      } catch (error) {
+        return '📱 *Mensagem interativa*\n\n_Esta mensagem contém elementos interativos. Visualize no celular._';
+      }
     }
 
     if (typeKey === 'locationMessage' || typeKey === 'liveLocationMessage') {
@@ -2083,10 +2158,28 @@ export class ChatwootService {
 
         if (reactionMessage) {
           if (reactionMessage.text) {
+            // Format reaction message with sender name
+            const isGroup = body.key.remoteJid.includes('@g.us');
+            const senderName = body.pushName || 'Unknown';
+            const reactionText = isGroup 
+              ? `${senderName} reagiu: ${reactionMessage.text}`
+              : `Reagiu: ${reactionMessage.text}`;
+
+            // Get the original message that was reacted to
+            const reactedToMsg = await this.prismaRepository.message.findFirst({
+              where: {
+                key: {
+                  path: ['id'],
+                  equals: reactionMessage.key.id,
+                },
+                instanceId: instance.instanceId,
+              },
+            });
+
             const send = await this.createMessage(
               instance,
               getConversation,
-              reactionMessage.text,
+              reactionText,
               messageType,
               false,
               [],
@@ -2094,7 +2187,7 @@ export class ChatwootService {
                 message: { extendedTextMessage: { contextInfo: { stanzaId: reactionMessage.key.id } } },
               },
               'WAID:' + body.key.id,
-              quotedMsg,
+              reactedToMsg,
             );
             if (!send) {
               this.logger.warn('message not sent');
@@ -2315,8 +2408,8 @@ export class ChatwootService {
         const messageType = key?.fromMe ? 'outgoing' : 'incoming';
 
         if (message.chatwootConversationId) {
-          const label = `\`${i18next.t('cw.message.edited')}\``; // "Mensagem editada"
-          const editedText = `${label}: ${editedMessageContent}`;
+          const label = `\`${i18next.t('cw.message.edited')}:\``; // "Mensagem editada:"
+          const editedText = `${label} ${editedMessageContent}`;
           const send = await this.createMessage(
             instance,
             message.chatwootConversationId,
