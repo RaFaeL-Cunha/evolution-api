@@ -1302,7 +1302,11 @@ export class ChatwootService {
         if (message) {
           const key = message.key as WAMessageKey;
 
-          await waInstance?.client.sendMessage(key.remoteJid, { delete: key });
+          // Delete for everyone (both mobile and WhatsApp Web)
+          await waInstance?.client.sendMessage(key.remoteJid, { 
+            delete: key,
+            revoke: true 
+          });
 
           await this.prismaRepository.message.deleteMany({
             where: {
@@ -2312,7 +2316,7 @@ export class ChatwootService {
 
         if (message.chatwootConversationId) {
           const label = `\`${i18next.t('cw.message.edited')}\``; // "Mensagem editada"
-          const editedText = `${label}:${editedMessageContent}`;
+          const editedText = `${label}: ${editedMessageContent}`;
           const send = await this.createMessage(
             instance,
             message.chatwootConversationId,

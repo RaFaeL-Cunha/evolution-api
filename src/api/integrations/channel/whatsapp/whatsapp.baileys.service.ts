@@ -562,9 +562,9 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       // Use raw SQL to avoid JSON path issues
       const webMessageInfo = (await this.prismaRepository.$queryRaw`
-        SELECT * FROM 'Message'
-        WHERE 'instanceId' = ${this.instanceId}
-        AND 'key'->>'id' = ${key.id}
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+        AND "key"->>'id' = ${key.id}
       `) as proto.IWebMessageInfo[];
 
       if (full) {
@@ -1958,9 +1958,9 @@ export class BaileysStartupService extends ChannelStartupService {
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
             // Use raw SQL to avoid JSON path issues
             const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM 'Message'
-              WHERE 'instanceId' = ${this.instanceId}
-              AND 'key'->>'id' = ${key.id}
+              SELECT * FROM "Message"
+              WHERE "instanceId" = ${this.instanceId}
+              AND "key"->>'id' = ${key.id}
               LIMIT 1
             `) as any[];
             findMessage = messages[0] || null;
@@ -2121,6 +2121,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // Helper to normalize participantId as phone number
       const normalizePhoneNumber = (id: string): string => {
+        // CORREÇÃO: Verifica se 'id' é uma string válida. Se não for, retorna string vazia.
+        if (typeof id !== 'string' || !id) {
+          return '';
+        }
         // Remove @lid, @s.whatsapp.net suffixes and extract just the number part
         return id.split('@')[0];
       };
@@ -2163,6 +2167,7 @@ export class BaileysStartupService extends ChannelStartupService {
             };
           }
         );
+
 
         // Mantém formato original + adiciona dados resolvidos
         const enhancedParticipantsUpdate = {
@@ -5617,25 +5622,49 @@ export class BaileysStartupService extends ChannelStartupService {
   ): Promise<number> {
     if (timestamp === undefined || timestamp === null) return 0;
 
-    // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE 'Message'
-      SET 'status' = ${status[4]}
-      WHERE 'instanceId' = ${this.instanceId}
-      AND 'key'->>'remoteJid' = ${remoteJid}
-      AND ('key'->>'fromMe')::boolean = false
-      AND 'messageTimestamp' <= ${timestamp}
-      AND ('status' IS NULL OR 'status' = ${status[3]})
-    `;
+    // Retry logic to handle deadlocks
+    const maxRetries = 3;
+    let lastError;
 
-    if (result) {
-      if (result > 0) {
-        this.updateChatUnreadMessages(remoteJid);
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        // Use raw SQL to avoid JSON path issues
+        const result = await this.prismaRepository.$executeRaw`
+          UPDATE "Message"
+          SET "status" = ${status[4]}
+          WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'remoteJid' = ${remoteJid}
+          AND ("key"->>'fromMe')::boolean = false
+          AND "messageTimestamp" <= ${timestamp}
+          AND ("status" IS NULL OR "status" = ${status[3]})
+        `;
+
+        if (result) {
+          if (result > 0) {
+            this.updateChatUnreadMessages(remoteJid);
+          }
+
+          return result;
+        }
+
+        return 0;
+      } catch (error) {
+        lastError = error;
+        // Check if it's a deadlock error (code 40P01)
+        if (error?.code === 'P2010' && error?.meta?.code === '40P01') {
+          // Wait before retry with exponential backoff
+          const waitTime = Math.min(100 * Math.pow(2, attempt), 1000);
+          await delay(waitTime);
+          this.logger.warn(`Deadlock detected, retrying (${attempt + 1}/${maxRetries})...`);
+          continue;
+        }
+        // If it's not a deadlock, throw immediately
+        throw error;
       }
-
-      return result;
     }
 
+    // If all retries failed, log and return 0 to avoid breaking the flow
+    this.logger.error(`Failed to update messages after ${maxRetries} retries: ${lastError?.message}`);
     return 0;
   }
 
@@ -5644,11 +5673,11 @@ export class BaileysStartupService extends ChannelStartupService {
       this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
       // Use raw SQL to avoid JSON path issues
       this.prismaRepository.$queryRaw`
-        SELECT COUNT(*)::int as count FROM 'Message'
-        WHERE 'instanceId' = ${this.instanceId}
-        AND 'key'->>'remoteJid' = ${remoteJid}
-        AND ('key'->>'fromMe')::boolean = false
-        AND 'status' = ${status[3]}
+        SELECT COUNT(*)::int as count FROM "Message" 
+        WHERE "instanceId" = ${this.instanceId}      
+        AND "key"->>'remoteJid' = ${remoteJid}
+        AND ("key"->>'fromMe')::boolean = false
+        AND "status" = ${status[3]}                  
       `.then((result: any[]) => result[0]?.count || 0),
     ]);
 
@@ -5662,23 +5691,25 @@ export class BaileysStartupService extends ChannelStartupService {
     return unreadMessages;
   }
 
+  // O método addLabel também precisa da correção
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
     const id = cuid();
 
     await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO 'Chat' ('id', 'instanceId', 'remoteJid', 'labels', 'createdAt', 'updatedAt')
-       VALUES ($4, $2, $3, to_jsonb(ARRAY[$1]::text[]), NOW(), NOW()) ON CONFLICT ('instanceId', 'remoteJid')
-     DO
-      UPDATE
-          SET 'labels' = (
+      // CORREÇÃO AQUI: "Chat" e aspas duplas em todos os nomes de colunas
+      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
+        VALUES ($4, $2, $3, to_jsonb(ARRAY[$1]::text[]), NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
+      DO
+       UPDATE
+          SET "labels" = (
           SELECT to_jsonb(array_agg(DISTINCT elem))
           FROM (
-          SELECT jsonb_array_elements_text('Chat'.'labels') AS elem
+          SELECT jsonb_array_elements_text("Chat"."labels") AS elem
           UNION
           SELECT $1::text AS elem
           ) sub
           ),
-          'updatedAt' = NOW();`,
+          "updatedAt" = NOW();`,
       labelId,
       instanceId,
       chatId,
@@ -5694,19 +5725,20 @@ export class BaileysStartupService extends ChannelStartupService {
     const id = cuid();
 
     await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO 'Chat' ('id', 'instanceId', 'remoteJid', 'labels', 'createdAt', 'updatedAt')
-       VALUES ($4, $2, $3, '[]'::jsonb, NOW(), NOW()) ON CONFLICT ('instanceId', 'remoteJid')
-     DO
-      UPDATE
-          SET 'labels' = COALESCE (
-          (
-          SELECT jsonb_agg(elem)
-          FROM jsonb_array_elements_text('Chat'.'labels') AS elem
-          WHERE elem <> $1
-          ),
-          '[]'::jsonb
-          ),
-          'updatedAt' = NOW();`,
+      // Aspas duplas em "Chat" e em todas as colunas
+      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
+         VALUES ($4, $2, $3, '[]'::jsonb, NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
+       DO
+        UPDATE
+           SET "labels" = COALESCE (
+           (
+           SELECT jsonb_agg(elem)
+           FROM jsonb_array_elements_text("Chat"."labels") AS elem
+           WHERE elem <> $1
+           ),
+           '[]'::jsonb
+           ),
+           "updatedAt" = NOW();`,
       labelId,
       instanceId,
       chatId,
