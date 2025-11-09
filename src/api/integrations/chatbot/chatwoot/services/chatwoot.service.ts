@@ -1742,7 +1742,7 @@ export class ChatwootService {
     if (typeKey === 'pollCreationMessageV3') {
       const pollName = result.name || 'Enquete';
       const options = result.options || [];
-      const maxSelections = result.selectableOptionsCount || 1;
+      const maxSelections = result.selectableOptionsCount ?? 1; // Use ?? instead of || to handle 0
       
       let formattedPoll = `📊 *Enquete: ${pollName}*\n\n`;
       formattedPoll += `_Opções:_\n`;
