@@ -575,6 +575,13 @@ export class ChatwootService {
     const isGroup = body.key.remoteJid.endsWith('@g.us');
     const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
     const { remoteJid } = body.key;
+    
+    if (!phoneNumber && !isGroup) {
+      this.logger.warn(
+        `phoneNumber is null - isLid: ${isLid}, isGroup: ${isGroup}, remoteJid: ${remoteJid}, remoteJidAlt: ${body.key.remoteJidAlt}`,
+      );
+    }
+    
     const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
     const maxWaitTime = 5000; // 5 seconds
@@ -584,18 +591,19 @@ export class ChatwootService {
     try {
       // Processa atualização de contatos já criados @lid
       if (phoneNumber && remoteJid && !isGroup) {
-        const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
+        const phoneNumberClean = phoneNumber.split('@')[0];
+        const contact = await this.findContact(instance, phoneNumberClean);
         if (contact && contact.identifier !== remoteJid) {
           this.logger.verbose(
             `Identifier needs update: (contact.identifier: ${contact.identifier}, phoneNumber: ${phoneNumber}, body.key.remoteJidAlt: ${remoteJid}`,
           );
           const updateContact = await this.updateContact(instance, contact.id, {
             identifier: phoneNumber,
-            phone_number: `+${phoneNumber.split('@')[0]}`,
+            phone_number: `+${phoneNumberClean}`,
           });
 
           if (updateContact === null) {
-            const baseContact = await this.findContact(instance, phoneNumber.split('@')[0]);
+            const baseContact = await this.findContact(instance, phoneNumberClean);
             if (baseContact) {
               await this.mergeContacts(baseContact.id, contact.id);
               this.logger.verbose(
@@ -664,7 +672,7 @@ export class ChatwootService {
           return (await this.cache.get(cacheKey)) as number;
         }
 
-        const chatId = isGroup ? remoteJid : phoneNumber.split('@')[0].split(':')[0];
+        const chatId = isGroup ? remoteJid : phoneNumber?.split('@')[0]?.split(':')[0] || remoteJid.split('@')[0].split(':')[0];
         let nameContact = !body.key.fromMe ? body.pushName : chatId;
         const filterInbox = await this.getInbox(instance);
         if (!filterInbox) return null;
@@ -674,8 +682,24 @@ export class ChatwootService {
           const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
-          const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
+          // Pega o participante correto, preferindo participantAlt se disponível e não for LID
+          let participantJid = body.key.participant;
+          if (isLid && !body.key.fromMe && body.key.participantAlt) {
+            // Se participantAlt não contém @lid, usa ele (é o número real)
+            if (!body.key.participantAlt.includes('@lid')) {
+              participantJid = body.key.participantAlt;
+            }
+          }
+          
           nameContact = `${group.subject} (GROUP)`;
+
+          if (!participantJid) {
+            this.logger.warn(
+              `participantJid is null - group: ${chatId}, isLid: ${isLid}, fromMe: ${body.key.fromMe}, participantAlt: ${body.key.participantAlt}, participant: ${body.key.participant}`,
+            );
+            await this.cache.delete(lockKey);
+            return null;
+          }
 
           const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
             participantJid.split('@')[0],
@@ -2063,7 +2087,9 @@ export class ChatwootService {
         const getConversation = await this.createConversation(instance, body);
 
         if (!getConversation) {
-          this.logger.warn('conversation not found');
+          this.logger.warn(
+            `conversation not found - remoteJid: ${body.key.remoteJid}, addressingMode: ${body.key.addressingMode}, remoteJidAlt: ${body.key.remoteJidAlt}`,
+          );
           return;
         }
 
@@ -2100,10 +2126,17 @@ export class ChatwootService {
 
           if (body.key.remoteJid.includes('@g.us')) {
             const participantName = body.pushName;
-            const rawPhoneNumber =
-              body.key.addressingMode === 'lid' && !body.key.fromMe
-                ? body.key.participantAlt.split('@')[0].split(':')[0]
-                : body.key.participant.split('@')[0].split(':')[0];
+            
+            // Pega o participante correto, preferindo participantAlt se disponível e não for LID
+            let participantJid = body.key.participant;
+            if (body.key.addressingMode === 'lid' && !body.key.fromMe && body.key.participantAlt) {
+              // Se participantAlt não contém @lid, usa ele (é o número real)
+              if (!body.key.participantAlt.includes('@lid')) {
+                participantJid = body.key.participantAlt;
+              }
+            }
+            
+            const rawPhoneNumber = participantJid.split('@')[0].split(':')[0];
             const formattedPhoneNumber = parsePhoneNumberFromString(`+${rawPhoneNumber}`).formatInternational();
 
             let content: string;
@@ -2256,10 +2289,17 @@ export class ChatwootService {
 
         if (body.key.remoteJid.includes('@g.us')) {
           const participantName = body.pushName;
-          const rawPhoneNumber =
-            body.key.addressingMode === 'lid' && !body.key.fromMe
-              ? body.key.participantAlt.split('@')[0].split(':')[0]
-              : body.key.participant.split('@')[0].split(':')[0];
+          
+          // Pega o participante correto, preferindo participantAlt se disponível e não for LID
+          let participantJid = body.key.participant;
+          if (body.key.addressingMode === 'lid' && !body.key.fromMe && body.key.participantAlt) {
+            // Se participantAlt não contém @lid, usa ele (é o número real)
+            if (!body.key.participantAlt.includes('@lid')) {
+              participantJid = body.key.participantAlt;
+            }
+          }
+          
+          const rawPhoneNumber = participantJid.split('@')[0].split(':')[0];
           const formattedPhoneNumber = parsePhoneNumberFromString(`+${rawPhoneNumber}`).formatInternational();
 
           let content: string;
