@@ -65,7 +65,7 @@ export class CacheService {
     return this.cache.has(key);
   }
 
-  async delete(key: string) {
+  async delete(key: string | string[]) {
     if (!this.cache) {
       return;
     }

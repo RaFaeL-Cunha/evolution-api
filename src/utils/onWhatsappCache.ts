@@ -160,12 +160,14 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
           data: dataPayload,
         });
       } else {
-        // Cria nova entrada
+        // Cria nova entrada com upsert para evitar race conditions
         logger.verbose(
           `[saveOnWhatsappCache] Register does not exist, creating: remoteJid=${remoteJid}, jidOptions=${dataPayload.jidOptions}, lid=${dataPayload.lid}`,
         );
-        await prismaRepository.isOnWhatsapp.create({
-          data: dataPayload,
+        await prismaRepository.isOnWhatsapp.upsert({
+          where: { remoteJid: remoteJid },
+          update: dataPayload,
+          create: dataPayload,
         });
       }
     } catch (e) {

@@ -1544,6 +1544,155 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const messageRaw = this.prepareMessage(received);
 
+          // Converter menções de LID em números de telefone legíveis com nomes de contato
+          // Em vez de @176407292411998, os usuários verão @5511951279027 - Henrique Nord
+          // Funciona tanto para mensagens recebidas quanto enviadas
+          const contextInfo = received.message?.extendedTextMessage?.contextInfo;
+          if (contextInfo?.mentionedJid && contextInfo.mentionedJid.length > 0) {
+            try {
+              const convertedMentions = await Promise.all(
+                contextInfo.mentionedJid.map(async (jid) => {
+                  // Se não for LID, retorna como está
+                  if (!jid.includes('@lid')) {
+                    return jid;
+                  }
+
+                  try {
+                    // Busca no cache IsOnWhatsapp o número de telefone associado a este LID
+                    const cached = await this.prismaRepository.isOnWhatsapp.findFirst({
+                      where: {
+                        OR: [
+                          { jidOptions: { contains: jid } },
+                          { remoteJid: jid },
+                        ],
+                      },
+                    });
+
+                    let phoneNumberJid = null;
+
+                    // Tenta obter o número de telefone do remoteJid
+                    if (cached?.remoteJid && !cached.remoteJid.includes('@lid')) {
+                      phoneNumberJid = cached.remoteJid;
+                    }
+                    // Se não encontrar, tenta extrair do jidOptions
+                    else if (cached?.jidOptions) {
+                      const options = cached.jidOptions.split(',');
+                      phoneNumberJid = options.find((opt: string) => opt.includes('@s.whatsapp.net'));
+                    }
+
+                    // Se encontrou um número de telefone, tenta buscar o nome do contato
+                    if (phoneNumberJid) {
+                      const contact = await this.prismaRepository.contact.findFirst({
+                        where: {
+                          instanceId: this.instanceId,
+                          remoteJid: phoneNumberJid,
+                        },
+                      });
+
+                      // Formato: 5511951279027 - Henrique Nord
+                      if (contact?.pushName) {
+                        const formattedNumber = phoneNumberJid.replace('@s.whatsapp.net', '');
+                        this.logger.verbose(
+                          `LID ${jid} convertido para ${formattedNumber} - ${contact.pushName}`
+                        );
+                        return `${formattedNumber} - ${contact.pushName}`;
+                      }
+
+                      this.logger.verbose(`LID ${jid} convertido para número ${phoneNumberJid}`);
+                      return phoneNumberJid;
+                    }
+
+                    // Se a conversão falhou, mantém o LID original
+                    this.logger.warn(`Não foi possível converter LID ${jid}, mantendo original`);
+                    return jid;
+                  } catch (error) {
+                    this.logger.error(`Erro ao converter LID ${jid}: ${error}`);
+                    return jid;
+                  }
+                })
+              );
+
+              // Guarda os JIDs originais ANTES de atualizar
+              const originalMentionedJids = [...contextInfo.mentionedJid];
+
+              // Substitui os LIDs no texto da mensagem ANTES de atualizar o mentionedJid
+              let messageText = received.message?.extendedTextMessage?.text || 
+                               received.message?.conversation;
+              
+              if (messageText) {
+                // Para cada LID original, substitui no texto pelo convertido
+                for (let i = 0; i < originalMentionedJids.length; i++) {
+                  const originalJid = originalMentionedJids[i];
+                  const convertedJid = convertedMentions[i];
+                  
+                  // Só substitui se foi convertido e era LID
+                  if (originalJid !== convertedJid && originalJid.includes('@lid')) {
+                    // Remove o @lid do original para buscar no texto (ex: 11368895926469)
+                    const lidNumber = originalJid.replace('@lid', '');
+                    
+                    let replacementText = convertedJid;
+                    
+                    // Se veio com @s.whatsapp.net, remove para ficar só o número
+                    if (replacementText.includes('@s.whatsapp.net')) {
+                      replacementText = replacementText.replace('@s.whatsapp.net', '');
+                    }
+                    
+                    // Substitui no texto: @11368895926469 -> @556696732359 ou @556696732359 - Nome
+                    messageText = messageText.replace(
+                      new RegExp(`@${lidNumber}`, 'g'),
+                      `@${replacementText}`
+                    );
+                  }
+                }
+
+                // Atualiza o texto da mensagem em todos os lugares
+                if (received.message?.extendedTextMessage?.text) {
+                  received.message.extendedTextMessage.text = messageText;
+                }
+                if (received.message?.conversation) {
+                  received.message.conversation = messageText;
+                }
+                if (messageRaw.message?.extendedTextMessage?.text) {
+                  messageRaw.message.extendedTextMessage.text = messageText;
+                }
+                if (messageRaw.message?.conversation) {
+                  messageRaw.message.conversation = messageText;
+                }
+              }
+
+              // AGORA SIM atualiza o mentionedJid (depois de substituir no texto)
+              contextInfo.mentionedJid = convertedMentions;
+
+              // Atualiza messageRaw se tiver o contextInfo
+              if (messageRaw.message?.extendedTextMessage?.contextInfo) {
+                messageRaw.message.extendedTextMessage.contextInfo.mentionedJid = convertedMentions;
+              }
+            } catch (error) {
+              this.logger.warn(`Falha ao converter menções LID para números de telefone: ${error}`);
+            }
+          }
+
+          // Também converte o participante LID para formato legível usando participantAlt
+          // Quando alguém com LID envia mensagem, mostra o número real + nome
+          if (received.key?.participant?.includes('@lid') && received.key?.participantAlt) {
+            try {
+              const phoneNumber = received.key.participantAlt.replace('@s.whatsapp.net', '');
+              const pushName = received.pushName || '';
+              
+              if (pushName) {
+                this.logger.verbose(
+                  `Participante LID ${received.key.participant} -> ${phoneNumber} - ${pushName}`
+                );
+              } else {
+                this.logger.verbose(
+                  `Participante LID ${received.key.participant} -> ${phoneNumber}`
+                );
+              }
+            } catch (error) {
+              this.logger.warn(`Falha ao logar conversão de participante LID: ${error}`);
+            }
+          }
+
           const isMedia =
             received?.message?.imageMessage ||
             received?.message?.videoMessage ||
@@ -2345,10 +2494,53 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         if (events['messages.upsert']) {
-          const payload = events['messages.upsert'];
+          try {
+            const payload = events['messages.upsert'];
 
-          this.messageProcessor.processMessage(payload, settings);
-          // this.messageHandle['messages.upsert'](payload, settings);
+            // Filtra mensagens com erros de descriptografia conhecidos
+            const filteredMessages = payload.messages.filter((msg) => {
+              // Verifica se a mensagem tem stub parameters com erros de sessão
+              if (msg?.messageStubParameters?.some?.((param) =>
+                [
+                  'No matching sessions found for message',
+                  'Bad MAC',
+                  'failed to decrypt message',
+                  'SessionError',
+                  'Invalid PreKey ID',
+                  'No session record',
+                  'No session found to decrypt message',
+                ].some((err) => param?.includes?.(err))
+              )) {
+                this.logger.warn(
+                  `Message filtered due to decryption error: ${msg.key?.id} ` +
+                  `(from: ${msg.key?.participant || msg.key?.remoteJid})`
+                );
+                return false;
+              }
+              return true;
+            });
+
+            if (filteredMessages.length > 0) {
+              this.messageProcessor.processMessage(
+                { ...payload, messages: filteredMessages },
+                settings
+              );
+            } else {
+              this.logger.warn('All messages in batch were filtered due to decryption errors');
+            }
+          } catch (error) {
+            const errorMsg = error?.message || String(error);
+            
+            // SessionError não deve quebrar o fluxo
+            if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
+              this.logger.warn(
+                `SessionError caught in eventHandler, continuing: ${errorMsg}`
+              );
+            } else {
+              // Outros erros são logados mas não quebram o fluxo
+              this.logger.error(`Error processing messages.upsert: ${errorMsg}`);
+            }
+          }
         }
 
         if (events['messages.update']) {
