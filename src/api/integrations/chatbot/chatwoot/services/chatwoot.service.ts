@@ -2669,16 +2669,47 @@ export class ChatwootService {
               ? `${senderName} reagiu: ${reactionMessage.text}`
               : `Reagiu: ${reactionMessage.text}`;
 
-            // Get the original message that was reacted to
-            const reactedToMsg = await this.prismaRepository.message.findFirst({
-              where: {
-                key: {
-                  path: ['id'],
-                  equals: reactionMessage.key.id,
+            // Get the original message that was reacted to (com retry para race condition)
+            let reactedToMsg = null;
+            let retryCount = 0;
+            const maxRetries = 3;
+
+            while (!reactedToMsg && retryCount < maxRetries) {
+              reactedToMsg = await this.prismaRepository.message.findFirst({
+                where: {
+                  key: {
+                    path: ['id'],
+                    equals: reactionMessage.key.id,
+                  },
+                  instanceId: instance.instanceId,
                 },
-                instanceId: instance.instanceId,
-              },
-            });
+              });
+
+              if (!reactedToMsg && retryCount < maxRetries - 1) {
+                this.logger.verbose(
+                  `[REACTION] Mensagem original não encontrada ainda, aguardando... (tentativa ${retryCount + 1}/${maxRetries})`,
+                );
+                await new Promise((resolve) => setTimeout(resolve, 500)); // Aguarda 500ms
+                retryCount++;
+              } else {
+                break;
+              }
+            }
+
+            // Log para diagnóstico
+            if (!reactedToMsg) {
+              this.logger.warn(
+                `[REACTION] Mensagem original não encontrada após ${maxRetries} tentativas. Key ID: ${reactionMessage.key.id}`,
+              );
+            } else if (!reactedToMsg.chatwootMessageId) {
+              this.logger.warn(
+                `[REACTION] Mensagem original encontrada mas sem chatwootMessageId. Key ID: ${reactionMessage.key.id}, Message ID: ${reactedToMsg.id}`,
+              );
+            } else {
+              this.logger.verbose(
+                `[REACTION] Vinculando reação à mensagem Chatwoot ID: ${reactedToMsg.chatwootMessageId}`,
+              );
+            }
 
             const send = await this.createMessage(
               instance,
