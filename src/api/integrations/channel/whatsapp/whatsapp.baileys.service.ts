@@ -99,6 +99,7 @@ import makeWASocket, {
   Chat,
   ConnectionState,
   Contact,
+  decryptPollVote,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
@@ -113,6 +114,7 @@ import makeWASocket, {
   isJidGroup,
   isJidNewsletter,
   isPnUser,
+  jidNormalizedUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   MessageUserReceiptUpdate,
@@ -133,6 +135,7 @@ import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
+import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
@@ -256,6 +259,7 @@ export class BaileysStartupService extends ChannelStartupService {
   });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+  private eventProcessingQueue: Promise<void> = Promise.resolve();
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -1193,7 +1197,10 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
+        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
+          isLatest,
+          progress,
+        });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.message.createMany({
@@ -1872,6 +1879,11 @@ export class BaileysStartupService extends ChannelStartupService {
                       true
                     );
 
+                    if (!media) {
+                      this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
+                      return;
+                    }
+
                     const { buffer, mediaType, fileName, size } = media;
                     const mimetype = mimeTypes.lookup(fileName).toString();
                     const fullName = join(
@@ -2085,8 +2097,6 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        if (update.message !== null && update.status === undefined) continue;
-
         const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
 
         const cached = await this.baileysCache.get(updateKey);
@@ -2098,7 +2108,11 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        await this.baileysCache.set(updateKey, true, 30 * 60);
+        if (update.messageTimestamp) {
+          await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
+        } else {
+          await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
+        }
 
         if (status[update.status] === 'READ' && key.fromMe) {
           if (
@@ -2132,20 +2146,33 @@ export class BaileysStartupService extends ChannelStartupService {
             remoteJid: key?.remoteJid,
             fromMe: key.fromMe,
             participant: key?.participant,
-            status: status[update.status] ?? 'DELETED',
+            status: status[update.status] ?? 'SERVER_ACK',
             pollUpdates,
             instanceId: this.instanceId,
           };
+
+          if (update.message) {
+            message.message = update.message;
+          }
 
           let findMessage: any;
           const configDatabaseData =
             this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
             // Use raw SQL to avoid JSON path issues
+            const protocolMapKey = `protocol_${key.id}`;
+            const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
+
+            if (originalMessageId) {
+              message.keyId = originalMessageId;
+            }
+
+            const searchId = originalMessageId || key.id;
+
             const messages = (await this.prismaRepository.$queryRaw`
               SELECT * FROM "Message"
               WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${key.id}
+              AND "key"->>'id' = ${searchId}
               LIMIT 1
             `) as any[];
             findMessage = messages[0] || null;
@@ -2162,7 +2189,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (update.message === null && update.status === undefined) {
-            this.sendDataWebhook(Events.MESSAGES_DELETE, key);
+            this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
             if (
               this.configService.get<Database>('DATABASE').SAVE_DATA
@@ -2311,7 +2338,7 @@ export class BaileysStartupService extends ChannelStartupService {
           return '';
         }
         // Remove @lid, @s.whatsapp.net suffixes and extract just the number part
-        return id.split('@')[0];
+        return String(id || '').split('@')[0];
       };
 
       try {
@@ -2472,12 +2499,12 @@ export class BaileysStartupService extends ChannelStartupService {
           const database = this.configService.get<Database>('DATABASE');
           const settings = await this.findSettings();
 
-        if (events.call) {
-          const call = events.call[0];
+            if (events.call) {
+              const call = events.call[0];
 
-          if (settings?.rejectCall && call.status == 'offer') {
-            this.client.rejectCall(call.id, call.from);
-          }
+              if (settings?.rejectCall && call.status == 'offer') {
+                this.client.rejectCall(call.id, call.from);
+              }
 
           if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
             if (call.from.endsWith('@lid')) {
@@ -2496,21 +2523,21 @@ export class BaileysStartupService extends ChannelStartupService {
             });
           }
 
-          this.sendDataWebhook(Events.CALL, call);
-        }
+              this.sendDataWebhook(Events.CALL, call);
+            }
 
-        if (events['connection.update']) {
-          this.connectionUpdate(events['connection.update']);
-        }
+            if (events['connection.update']) {
+              this.connectionUpdate(events['connection.update']);
+            }
 
-        if (events['creds.update']) {
-          this.instance.authState.saveCreds();
-        }
+            if (events['creds.update']) {
+              this.instance.authState.saveCreds();
+            }
 
-        if (events['messaging-history.set']) {
-          const payload = events['messaging-history.set'];
-          this.messageHandle['messaging-history.set'](payload);
-        }
+            if (events['messaging-history.set']) {
+              const payload = events['messaging-history.set'];
+              await this.messageHandle['messaging-history.set'](payload);
+            }
 
         if (events['messages.upsert']) {
           try {
@@ -2562,10 +2589,10 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }
 
-        if (events['messages.update']) {
-          const payload = events['messages.update'];
-          this.messageHandle['messages.update'](payload, settings);
-        }
+            if (events['messages.update']) {
+              const payload = events['messages.update'];
+              await this.messageHandle['messages.update'](payload, settings);
+            }
 
         if (events['message-receipt.update']) {
           const payload = events[
@@ -2592,68 +2619,72 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        if (events['presence.update']) {
-          const payload = events['presence.update'];
+            if (events['presence.update']) {
+              const payload = events['presence.update'];
 
-          if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-            return;
+              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                return;
+              }
+
+              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+            }
+
+            if (!settings?.groupsIgnore) {
+              if (events['groups.upsert']) {
+                const payload = events['groups.upsert'];
+                this.groupHandler['groups.upsert'](payload);
+              }
+
+              if (events['groups.update']) {
+                const payload = events['groups.update'];
+                this.groupHandler['groups.update'](payload);
+              }
+
+              if (events['group-participants.update']) {
+                const payload = events['group-participants.update'] as any;
+                this.groupHandler['group-participants.update'](payload);
+              }
+            }
+
+            if (events['chats.upsert']) {
+              const payload = events['chats.upsert'];
+              this.chatHandle['chats.upsert'](payload);
+            }
+
+            if (events['chats.update']) {
+              const payload = events['chats.update'];
+              this.chatHandle['chats.update'](payload);
+            }
+
+            if (events['chats.delete']) {
+              const payload = events['chats.delete'];
+              this.chatHandle['chats.delete'](payload);
+            }
+
+            if (events['contacts.upsert']) {
+              const payload = events['contacts.upsert'];
+              this.contactHandle['contacts.upsert'](payload);
+            }
+
+            if (events['contacts.update']) {
+              const payload = events['contacts.update'];
+              this.contactHandle['contacts.update'](payload);
+            }
+
+            if (events[Events.LABELS_ASSOCIATION]) {
+              const payload = events[Events.LABELS_ASSOCIATION];
+              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
+              return;
+            }
+
+            if (events[Events.LABELS_EDIT]) {
+              const payload = events[Events.LABELS_EDIT];
+              this.labelHandle[Events.LABELS_EDIT](payload);
+              return;
+            }
           }
-
-          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-        }
-
-        if (!settings?.groupsIgnore) {
-          if (events['groups.upsert']) {
-            const payload = events['groups.upsert'];
-            this.groupHandler['groups.upsert'](payload);
-          }
-
-          if (events['groups.update']) {
-            const payload = events['groups.update'];
-            this.groupHandler['groups.update'](payload);
-          }
-
-          if (events['group-participants.update']) {
-            const payload = events['group-participants.update'] as any;
-            this.groupHandler['group-participants.update'](payload);
-          }
-        }
-
-        if (events['chats.upsert']) {
-          const payload = events['chats.upsert'];
-          this.chatHandle['chats.upsert'](payload);
-        }
-
-        if (events['chats.update']) {
-          const payload = events['chats.update'];
-          this.chatHandle['chats.update'](payload);
-        }
-
-        if (events['chats.delete']) {
-          const payload = events['chats.delete'];
-          this.chatHandle['chats.delete'](payload);
-        }
-
-        if (events['contacts.upsert']) {
-          const payload = events['contacts.upsert'];
-          this.contactHandle['contacts.upsert'](payload);
-        }
-
-        if (events['contacts.update']) {
-          const payload = events['contacts.update'];
-          this.contactHandle['contacts.update'](payload);
-        }
-
-        if (events[Events.LABELS_ASSOCIATION]) {
-          const payload = events[Events.LABELS_ASSOCIATION];
-          this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-          return;
-        }
-
-        if (events[Events.LABELS_EDIT]) {
-          const payload = events[Events.LABELS_EDIT];
-          this.labelHandle[Events.LABELS_EDIT](payload);
-          return;
+        } catch (error) {
+          this.logger.error(error);
         }
         }
       } catch (error) {
@@ -3212,6 +3243,11 @@ export class BaileysStartupService extends ChannelStartupService {
                 { message },
                 true
               );
+
+              if (!media) {
+                this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
+                return;
+              }
 
               const { buffer, mediaType, fileName, size } = media;
 

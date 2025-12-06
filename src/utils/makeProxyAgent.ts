@@ -1,3 +1,4 @@
+import { socksDispatcher } from 'fetch-socks';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
@@ -17,12 +18,23 @@ function selectProxyAgent(proxyUrl: string): HttpsProxyAgent<string> | SocksProx
 
   const PROXY_HTTP_PROTOCOL = 'http:';
   const PROXY_SOCKS_PROTOCOL = 'socks:';
+  const PROXY_SOCKS5_PROTOCOL = 'socks5:';
 
   switch (url.protocol) {
     case PROXY_HTTP_PROTOCOL:
       return new HttpsProxyAgent(url);
     case PROXY_SOCKS_PROTOCOL:
-      return new SocksProxyAgent(url);
+    case PROXY_SOCKS5_PROTOCOL: {
+      let urlSocks = '';
+
+      if (url.username && url.password) {
+        urlSocks = `socks://${url.username}:${url.password}@${url.hostname}:${url.port}`;
+      } else {
+        urlSocks = `socks://${url.hostname}:${url.port}`;
+      }
+
+      return new SocksProxyAgent(urlSocks);
+    }
     default:
       throw new Error(`Unsupported proxy protocol: ${url.protocol}`);
   }
@@ -44,8 +56,8 @@ export function makeProxyAgent(proxy: Proxy | string): HttpsProxyAgent<string> |
 }
 
 export function makeProxyAgentUndici(proxy: Proxy | string): ProxyAgent {
-  let proxyUrl: string
-  let protocol: string
+  let proxyUrl: string;
+  let protocol: string;
 
   if (typeof proxy === 'string') {
     const url = new URL(proxy);
@@ -59,8 +71,8 @@ export function makeProxyAgentUndici(proxy: Proxy | string): ProxyAgent {
       protocol = 'socks5';
     }
 
-    const auth = username && password ? `${username}:${password}@` : ''
-    proxyUrl = `${protocol}://${auth}${host}:${port}`
+    const auth = username && password ? `${username}:${password}@` : '';
+    proxyUrl = `${protocol}://${auth}${host}:${port}`;
   }
 
   const PROXY_HTTP_PROTOCOL = 'http';
@@ -71,6 +83,8 @@ export function makeProxyAgentUndici(proxy: Proxy | string): ProxyAgent {
   switch (protocol) {
     case PROXY_HTTP_PROTOCOL:
     case PROXY_HTTPS_PROTOCOL:
+      return new ProxyAgent(proxyUrl);
+
     case PROXY_SOCKS4_PROTOCOL:
     case PROXY_SOCKS5_PROTOCOL:
       return new ProxyAgent(proxyUrl);
