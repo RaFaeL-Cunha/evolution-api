@@ -2850,16 +2850,6 @@ export class ChatwootService {
             content = `${bodyMessage}`;
           }
 
-          // Converte timestamp para segundos (Chatwoot usa Unix timestamp em segundos)
-          let messageTimestamp: number | undefined;
-          if (body.messageTimestamp) {
-            if (Long.isLong(body.messageTimestamp)) {
-              messageTimestamp = body.messageTimestamp.toNumber();
-            } else {
-              messageTimestamp = Number(body.messageTimestamp);
-            }
-          }
-
           const send = await this.createMessage(
             instance,
             getConversation,
@@ -2870,7 +2860,6 @@ export class ChatwootService {
             body,
             'WAID:' + body.key.id,
             quotedMsg,
-            messageTimestamp,
           );
 
           if (!send) {
@@ -2887,16 +2876,6 @@ export class ChatwootService {
 
           return send;
         } else {
-          // Converte timestamp para segundos (Chatwoot usa Unix timestamp em segundos)
-          let messageTimestamp: number | undefined;
-          if (body.messageTimestamp) {
-            if (Long.isLong(body.messageTimestamp)) {
-              messageTimestamp = body.messageTimestamp.toNumber();
-            } else {
-              messageTimestamp = Number(body.messageTimestamp);
-            }
-          }
-
           const send = await this.createMessage(
             instance,
             getConversation,
@@ -2907,7 +2886,6 @@ export class ChatwootService {
             body,
             'WAID:' + body.key.id,
             quotedMsg,
-            messageTimestamp,
           );
 
           if (!send) {
