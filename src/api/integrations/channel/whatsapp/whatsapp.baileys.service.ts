@@ -6404,6 +6404,7 @@ export class BaileysStartupService extends ChannelStartupService {
         source: true,
         contextInfo: true,
         MessageUpdate: { select: { status: true } },
+        Media: { select: { fileName: true, type: true, mimetype: true } },
       },
     });
 
@@ -6425,6 +6426,17 @@ export class BaileysStartupService extends ChannelStartupService {
           } else if (messageKey.participant) {
             message.pushName = messageKey.participant.split('@')[0];
           }
+        }
+      }
+
+      // Adiciona URL da mídia se existir
+      if (message['Media'] && message['Media'].fileName) {
+        const s3Config = this.configService.get<S3>('S3');
+        if (s3Config.ENABLE) {
+          const protocol = s3Config.USE_SSL ? 'https' : 'http';
+          const port = s3Config.PORT && s3Config.PORT !== 443 && s3Config.PORT !== 80 ? `:${s3Config.PORT}` : '';
+          const endpoint = s3Config.ENDPOINT.replace(/^https?:\/\//, '');
+          message['mediaUrl'] = `${protocol}://${endpoint}${port}/${s3Config.BUCKET_NAME}/${message['Media'].fileName}`;
         }
       }
 
