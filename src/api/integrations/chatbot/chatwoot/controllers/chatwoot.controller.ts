@@ -9,7 +9,7 @@ export class ChatwootController {
   constructor(
     private readonly chatwootService: ChatwootService,
     private readonly configService: ConfigService,
-  ) { }
+  ) {}
 
   public async createChatwoot(instance: InstanceDto, data: ChatwootDto) {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');

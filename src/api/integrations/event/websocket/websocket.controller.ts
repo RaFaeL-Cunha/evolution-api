@@ -34,10 +34,12 @@ export class WebsocketController extends EventController implements EventControl
           const websocketConfig = configService.get<Websocket>('WEBSOCKET');
           const allowedHosts = websocketConfig.ALLOWED_HOSTS || '127.0.0.1,::1,::ffff:127.0.0.1';
           const allowAllHosts = allowedHosts.trim() === '*';
-          const isAllowedHost = allowAllHosts || allowedHosts
-            .split(',')
-            .map((h) => h.trim())
-            .includes(remoteAddress);
+          const isAllowedHost =
+            allowAllHosts ||
+            allowedHosts
+              .split(',')
+              .map((h) => h.trim())
+              .includes(remoteAddress);
 
           if (params.has('EIO') && isAllowedHost) {
             return callback(null, true);

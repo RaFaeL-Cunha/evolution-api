@@ -30,7 +30,7 @@ export class InstanceController {
     private readonly chatwootCache: CacheService,
     private readonly baileysCache: CacheService,
     private readonly providerFiles: ProviderFiles,
-  ) { }
+  ) {}
 
   private readonly logger = new Logger('InstanceController');
 

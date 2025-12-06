@@ -27,7 +27,7 @@ export class ChannelStartupService {
     public readonly eventEmitter: EventEmitter2,
     public readonly prismaRepository: PrismaRepository,
     public readonly chatwootCache: CacheService,
-  ) { }
+  ) {}
 
   public readonly logger = new Logger('ChannelStartupService');
 
@@ -794,19 +794,19 @@ export class ChannelStartupService {
       const mappedResults = results.map((contact) => {
         const lastMessage = contact.lastMessageId
           ? {
-            id: contact.lastMessageId,
-            key: contact.lastMessage_key,
-            pushName: contact.lastMessagePushName,
-            participant: contact.lastMessageParticipant,
-            messageType: contact.lastMessageMessageType,
-            message: contact.lastMessageMessage,
-            contextInfo: contact.lastMessageContextInfo,
-            source: contact.lastMessageSource,
-            messageTimestamp: contact.lastMessageMessageTimestamp,
-            instanceId: contact.lastMessageInstanceId,
-            sessionId: contact.lastMessageSessionId,
-            status: contact.lastMessageStatus,
-          }
+              id: contact.lastMessageId,
+              key: contact.lastMessage_key,
+              pushName: contact.lastMessagePushName,
+              participant: contact.lastMessageParticipant,
+              messageType: contact.lastMessageMessageType,
+              message: contact.lastMessageMessage,
+              contextInfo: contact.lastMessageContextInfo,
+              source: contact.lastMessageSource,
+              messageTimestamp: contact.lastMessageMessageTimestamp,
+              instanceId: contact.lastMessageInstanceId,
+              sessionId: contact.lastMessageSessionId,
+              status: contact.lastMessageStatus,
+            }
           : undefined;
 
         return {

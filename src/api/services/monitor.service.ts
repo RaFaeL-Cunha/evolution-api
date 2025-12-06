@@ -99,11 +99,11 @@ export class WAMonitoringService {
     const where =
       instanceNames && instanceNames.length > 0
         ? {
-          name: {
-            in: instanceNames,
-          },
-          clientName,
-        }
+            name: {
+              in: instanceNames,
+            },
+            clientName,
+          }
         : { clientName };
 
     const instances = await this.prismaRepository.instance.findMany({

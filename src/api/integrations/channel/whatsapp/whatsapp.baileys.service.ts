@@ -1875,7 +1875,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (update.messageTimestamp) {
           await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
         } else {
-          await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
+          await this.baileysCache.set(updateKey, Math.floor(Date.now() / 1000), 30 * 60);
         }
 
         if (status[update.status] === 'READ' && key.fromMe) {

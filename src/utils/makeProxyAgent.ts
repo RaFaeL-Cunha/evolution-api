@@ -1,7 +1,6 @@
 import { socksDispatcher } from 'fetch-socks';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
-
 import { ProxyAgent } from 'undici';
 
 type Proxy = {
@@ -14,7 +13,6 @@ type Proxy = {
 
 function selectProxyAgent(proxyUrl: string): HttpsProxyAgent<string> | SocksProxyAgent {
   const url = new URL(proxyUrl);
-
 
   const PROXY_HTTP_PROTOCOL = 'http:';
   const PROXY_SOCKS_PROTOCOL = 'socks:';
@@ -62,10 +60,10 @@ export function makeProxyAgentUndici(proxy: Proxy | string): ProxyAgent {
   if (typeof proxy === 'string') {
     const url = new URL(proxy);
     protocol = url.protocol.replace(':', '');
-    proxyUrl = proxy
+    proxyUrl = proxy;
   } else {
     const { host, password, port, protocol: proto, username } = proxy;
-    protocol = (proto || 'http').replace(':', '')
+    protocol = (proto || 'http').replace(':', '');
 
     if (protocol === 'socks') {
       protocol = 'socks5';

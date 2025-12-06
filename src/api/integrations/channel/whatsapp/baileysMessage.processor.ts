@@ -37,11 +37,11 @@ export class BaileysMessageProcessor {
       if (!msg.key?.id || !msg.key?.remoteJid) return true;
 
       const messageKey = `${msg.key.remoteJid}_${msg.key.id}_${msg.key.participant || ''}`;
-      
+
       // If message has already caused SessionError, ignore it
       if (this.sessionErrorCache.has(messageKey)) {
         this.processorLogs.warn(
-          `Ignorando mensagem com erro de sessão conhecido: ${messageKey} (participante: ${msg.key.participant || 'N/A'})`
+          `Ignorando mensagem com erro de sessão conhecido: ${messageKey} (participante: ${msg.key.participant || 'N/A'})`,
         );
         return false;
       }
@@ -58,10 +58,10 @@ export class BaileysMessageProcessor {
 
     const messageKey = `${msg.key.remoteJid}_${msg.key.id}_${msg.key.participant || ''}`;
     this.sessionErrorCache.set(messageKey, Date.now());
-    
+
     this.processorLogs.warn(
       `Mensagem marcada como problemática devido a erro de sessão: ${messageKey} ` +
-      `(de: ${msg.key.participant || msg.key.remoteJid})`
+        `(de: ${msg.key.participant || msg.key.remoteJid})`,
     );
   }
 
@@ -91,38 +91,34 @@ export class BaileysMessageProcessor {
         tap(({ messages }) => {
           const filtered = this.filterProblematicMessages(messages);
           if (filtered.length < messages.length) {
-            this.processorLogs.warn(
-              `Filtradas ${messages.length - filtered.length} mensagens problemáticas do lote`
-            );
+            this.processorLogs.warn(`Filtradas ${messages.length - filtered.length} mensagens problemáticas do lote`);
           }
         }),
         concatMap(({ messages, type, requestId, settings }) => {
           const filteredMessages = this.filterProblematicMessages(messages);
-          
+
           // If no valid messages remain, skip processing
           if (filteredMessages.length === 0) {
             this.processorLogs.warn('Todas as mensagens do lote foram filtradas, pulando processamento');
             return EMPTY;
           }
 
-          return from(
-            onMessageReceive({ messages: filteredMessages, type, requestId }, settings)
-          ).pipe(
+          return from(onMessageReceive({ messages: filteredMessages, type, requestId }, settings)).pipe(
             retryWhen((errors) =>
               errors.pipe(
                 tap((error) => {
                   const errorMsg = error?.message || String(error);
-                  
+
                   // Detect SessionError and mark messages as problematic
                   if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
                     this.processorLogs.warn(
-                      `Erro de sessão detectado, marcando ${filteredMessages.length} mensagem(ns) como problemática(s)`
+                      `Erro de sessão detectado, marcando ${filteredMessages.length} mensagem(ns) como problemática(s)`,
                     );
                     filteredMessages.forEach((msg) => this.markMessageAsProblematic(msg));
                     // Don't retry for SessionError - it won't resolve without re-establishing encryption
                     throw error;
                   }
-                  
+
                   this.processorLogs.warn(`Tentando novamente lote de mensagens devido a erro: ${errorMsg}`);
                 }),
                 delay(1000), // 1 second delay between retries
@@ -131,15 +127,15 @@ export class BaileysMessageProcessor {
             ),
             catchError((error) => {
               const errorMsg = error?.message || String(error);
-              
+
               // SessionError is not critical - log and continue processing other messages
               if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
                 this.processorLogs.warn(
-                  `Erro de sessão encontrado, mensagens foram filtradas e serão ignoradas por 30 minutos`
+                  `Erro de sessão encontrado, mensagens foram filtradas e serão ignoradas por 30 minutos`,
                 );
                 return EMPTY;
               }
-              
+
               // Other errors are propagated
               throw error;
             }),
