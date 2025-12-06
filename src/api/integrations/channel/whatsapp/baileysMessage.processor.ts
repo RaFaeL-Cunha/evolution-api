@@ -41,7 +41,7 @@ export class BaileysMessageProcessor {
       // If message has already caused SessionError, ignore it
       if (this.sessionErrorCache.has(messageKey)) {
         this.processorLogs.warn(
-          `Ignoring message with known SessionError: ${messageKey} (participant: ${msg.key.participant || 'N/A'})`
+          `Ignorando mensagem com erro de sessão conhecido: ${messageKey} (participante: ${msg.key.participant || 'N/A'})`
         );
         return false;
       }
@@ -60,8 +60,8 @@ export class BaileysMessageProcessor {
     this.sessionErrorCache.set(messageKey, Date.now());
     
     this.processorLogs.warn(
-      `Message marked as problematic due to SessionError: ${messageKey} ` +
-      `(from: ${msg.key.participant || msg.key.remoteJid})`
+      `Mensagem marcada como problemática devido a erro de sessão: ${messageKey} ` +
+      `(de: ${msg.key.participant || msg.key.remoteJid})`
     );
   }
 
@@ -73,7 +73,7 @@ export class BaileysMessageProcessor {
 
     // Se o Subject foi completado, recriar
     if (this.messageSubject.closed) {
-      this.processorLogs.warn('MessageSubject was closed, recreating...');
+      this.processorLogs.warn('MessageSubject foi fechado, recriando...');
       this.messageSubject = new Subject<{
         messages: WAMessage[];
         type: MessageUpsertType;
@@ -85,14 +85,14 @@ export class BaileysMessageProcessor {
     this.subscription = this.messageSubject
       .pipe(
         tap(({ messages }) => {
-          this.processorLogs.log(`Processing batch of ${messages.length} messages`);
+          this.processorLogs.log(`Processando lote de ${messages.length} mensagens`);
         }),
         // Filter problematic messages before processing
         tap(({ messages }) => {
           const filtered = this.filterProblematicMessages(messages);
           if (filtered.length < messages.length) {
             this.processorLogs.warn(
-              `Filtered ${messages.length - filtered.length} problematic messages from batch`
+              `Filtradas ${messages.length - filtered.length} mensagens problemáticas do lote`
             );
           }
         }),
@@ -101,7 +101,7 @@ export class BaileysMessageProcessor {
           
           // If no valid messages remain, skip processing
           if (filteredMessages.length === 0) {
-            this.processorLogs.warn('All messages in batch were filtered out, skipping processing');
+            this.processorLogs.warn('Todas as mensagens do lote foram filtradas, pulando processamento');
             return EMPTY;
           }
 
@@ -116,14 +116,14 @@ export class BaileysMessageProcessor {
                   // Detect SessionError and mark messages as problematic
                   if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
                     this.processorLogs.warn(
-                      `SessionError detected, marking ${filteredMessages.length} message(s) as problematic`
+                      `Erro de sessão detectado, marcando ${filteredMessages.length} mensagem(ns) como problemática(s)`
                     );
                     filteredMessages.forEach((msg) => this.markMessageAsProblematic(msg));
                     // Don't retry for SessionError - it won't resolve without re-establishing encryption
                     throw error;
                   }
                   
-                  this.processorLogs.warn(`Retrying message batch due to error: ${errorMsg}`);
+                  this.processorLogs.warn(`Tentando novamente lote de mensagens devido a erro: ${errorMsg}`);
                 }),
                 delay(1000), // 1 second delay between retries
                 take(3), // Maximum 3 retry attempts
@@ -135,7 +135,7 @@ export class BaileysMessageProcessor {
               // SessionError is not critical - log and continue processing other messages
               if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
                 this.processorLogs.warn(
-                  `SessionError encountered, messages have been filtered and will be ignored for 30 minutes`
+                  `Erro de sessão encontrado, mensagens foram filtradas e serão ignoradas por 30 minutos`
                 );
                 return EMPTY;
               }
@@ -146,13 +146,13 @@ export class BaileysMessageProcessor {
           );
         }),
         catchError((error) => {
-          this.processorLogs.error(`Error processing message batch: ${error}`);
+          this.processorLogs.error(`Erro ao processar lote de mensagens: ${error}`);
           return EMPTY;
         }),
       )
       .subscribe({
         error: (error) => {
-          this.processorLogs.error(`Message stream error: ${error}`);
+          this.processorLogs.error(`Erro no fluxo de mensagens: ${error}`);
         },
       });
   }

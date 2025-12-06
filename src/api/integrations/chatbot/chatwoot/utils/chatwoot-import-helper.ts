@@ -50,7 +50,9 @@ class ChatwootImport {
     const actualValue = this.historyMessages.has(instance.instanceName)
       ? this.historyMessages.get(instance.instanceName)
       : [];
+    const newTotal = actualValue.length + messagesRaw.length;
     this.historyMessages.set(instance.instanceName, [...actualValue, ...messagesRaw]);
+    this.logger.verbose(`📥 Adicionadas ${messagesRaw.length} mensagens ao histórico (total: ${newTotal})`);
   }
 
   public addHistoryContacts(instance: InstanceDto, contactsRaw: Contact[]) {
@@ -194,14 +196,25 @@ class ChatwootImport {
         ? 'SELECT source_id FROM messages WHERE source_id = ANY($1) AND conversation_id = $2'
         : 'SELECT source_id FROM messages WHERE source_id = ANY($1)';
 
+      this.logger.verbose(`🔍 Buscando source_ids no Chatwoot: ${formattedSourceIds.length} IDs`);
+      if (formattedSourceIds.length <= 5) {
+        this.logger.verbose(`   IDs buscados: ${formattedSourceIds.join(', ')}`);
+      }
+      this.logger.verbose(`   Query: ${query}`);
+
       const result = await pgClient.query(query, params);
+      
+      this.logger.verbose(`🔍 Resultado da busca: ${result.rows.length} mensagens encontradas`);
+      
       for (const row of result.rows) {
         existingSourceIdsSet.add(row.source_id);
+        this.logger.verbose(`   ✅ Encontrado: ${row.source_id}`);
       }
 
       return existingSourceIdsSet;
     } catch (error) {
       this.logger.error(`Error on getExistingSourceIds: ${error.toString()}`);
+      this.logger.error(`Stack: ${error.stack}`);
       return new Set<string>();
     }
   }
@@ -211,12 +224,26 @@ class ChatwootImport {
     chatwootService: ChatwootService,
     inbox: inbox,
     provider: ChatwootModel,
+    showBotMessages: boolean = true, // 🔧 Controla se mostra mensagens pro bot
   ) {
     try {
+      this.logger.log(`📥 Iniciando importação de histórico para ${instance.instanceName}`);
+      
+      // Envia mensagem inicial pro bot do Chatwoot (só se showBotMessages = true)
+      if (showBotMessages && configService.get<Chatwoot>('CHATWOOT').BOT_CONTACT) {
+        const i18next = await import('@utils/i18n').then(m => m.default);
+        await chatwootService.createBotMessage(
+          instance,
+          i18next.t('cw.import.startImport'),
+          'incoming'
+        ).catch(() => {}); // Ignora erro se falhar
+      }
+      
       const pgClient = postgresClient.getChatwootConnection();
 
       const chatwootUser = await this.getChatwootUser(provider);
       if (!chatwootUser) {
+        this.logger.error('❌ Usuário Chatwoot não encontrado para importação');
         throw new Error('User not found to import messages.');
       }
 
@@ -224,8 +251,11 @@ class ChatwootImport {
 
       let messagesOrdered = this.historyMessages.get(instance.instanceName) || [];
       if (messagesOrdered.length === 0) {
+        this.logger.warn(`⚠️ Nenhuma mensagem no histórico para importar (${instance.instanceName})`);
         return 0;
       }
+      
+      this.logger.log(`📊 Total de mensagens no histórico: ${messagesOrdered.length}`);
 
       // ordering messages by number and timestamp asc
       messagesOrdered.sort((a, b) => {
@@ -254,11 +284,45 @@ class ChatwootImport {
       });
 
       const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
-      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
+      const beforeFilter = messagesOrdered.length;
+      
+      this.logger.verbose(`🔍 Source IDs existentes no Chatwoot: ${existingSourceIds.size}`);
+      if (existingSourceIds.size > 0 && existingSourceIds.size < 10) {
+        this.logger.verbose(`   IDs: ${Array.from(existingSourceIds).join(', ')}`);
+      }
+      
+      messagesOrdered = messagesOrdered.filter((message: any) => {
+        const sourceId = `WAID:${message.key.id}`;
+        const isDuplicate = existingSourceIds.has(sourceId);
+        if (isDuplicate) {
+          this.logger.verbose(`   ⚠️ Duplicata detectada: ${sourceId}`);
+        }
+        return !isDuplicate;
+      });
+      const duplicatesCount = beforeFilter - messagesOrdered.length;
+      
+      this.logger.log(`🔍 Mensagens duplicadas filtradas: ${duplicatesCount}`);
+      this.logger.log(`📝 Mensagens para importar: ${messagesOrdered.length}`);
+      // Envia mensagem de progresso pro bot (só se showBotMessages = true)
+      if (showBotMessages && configService.get<Chatwoot>('CHATWOOT').BOT_CONTACT && messagesOrdered.length > 0) {
+        const i18next = await import('@utils/i18n').then(m => m.default);
+        await chatwootService.createBotMessage(
+          instance,
+          i18next.t('cw.import.importingMessages'),
+          'incoming'
+        ).catch(() => {});
+      }
+
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
+      let batchNumber = 1;
+      const totalBatches = Math.ceil(messagesOrdered.length / batchSize);
+      
+      this.logger.log(`🔄 Processando em ${totalBatches} lote(s) de até ${batchSize} mensagens`);
+      
       while (messagesChunk.length > 0) {
+        this.logger.log(`📦 Processando lote ${batchNumber}/${totalBatches} (${messagesChunk.length} mensagens)`);
         // Map structure: +552199999999 => Message[]
         const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk);
 
@@ -276,22 +340,32 @@ class ChatwootImport {
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
           const bindInsertMsg = [provider.accountId, inbox.id];
 
+          let skippedNoMessage = 0;
+          let skippedNoFks = 0;
+          let skippedNoContent = 0;
+          let processedMessages = 0;
+
           messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
             const fksChatwoot = fksByNumber.get(phoneNumber);
 
             messages.forEach((message) => {
               if (!message.message) {
+                skippedNoMessage++;
                 return;
               }
 
               if (!fksChatwoot?.conversation_id || !fksChatwoot?.contact_id) {
+                skippedNoFks++;
                 return;
               }
 
               const contentMessage = this.getContentMessage(chatwootService, message);
               if (!contentMessage) {
+                skippedNoContent++;
                 return;
               }
+              
+              processedMessages++;
 
               bindInsertMsg.push(contentMessage);
               const bindContent = `$${bindInsertMsg.length}`;
@@ -311,21 +385,47 @@ class ChatwootImport {
               bindInsertMsg.push('WAID:' + message.key.id);
               const bindSourceId = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push(message.messageTimestamp as number);
+              // 🔧 FIX: Converte timestamp corretamente (pode vir em segundos ou milissegundos)
+              let messageTimestamp = message.messageTimestamp as number;
+              
+              // Se timestamp está em milissegundos (> ano 2100 em segundos), converte para segundos
+              if (messageTimestamp > 4102444800) {
+                messageTimestamp = Math.floor(messageTimestamp / 1000);
+              }
+              
+              bindInsertMsg.push(messageTimestamp);
               const bindmessageTimestamp = `$${bindInsertMsg.length}`;
 
               sqlInsertMsg += `(${bindContent}, ${bindContent}, $1, $2, ${bindConversationId}, ${bindMessageType}, FALSE, 0,
                   ${bindSenderType},${bindSenderId},${bindSourceId}, to_timestamp(${bindmessageTimestamp}), to_timestamp(${bindmessageTimestamp})),`;
             });
           });
+          // Log de mensagens filtradas
+          if (skippedNoMessage > 0) {
+            this.logger.warn(`⚠️ Lote ${batchNumber}: ${skippedNoMessage} mensagens sem conteúdo (message vazio)`);
+          }
+          if (skippedNoFks > 0) {
+            this.logger.warn(`⚠️ Lote ${batchNumber}: ${skippedNoFks} mensagens sem conversação/contato no Chatwoot`);
+          }
+          if (skippedNoContent > 0) {
+            this.logger.warn(`⚠️ Lote ${batchNumber}: ${skippedNoContent} mensagens sem conteúdo válido (getContentMessage retornou null)`);
+          }
+          
+          this.logger.log(`📊 Lote ${batchNumber}: ${processedMessages} mensagens processadas para inserção`);
+
           if (bindInsertMsg.length > 2) {
             if (sqlInsertMsg.slice(-1) === ',') {
               sqlInsertMsg = sqlInsertMsg.slice(0, -1);
             }
-            totalMessagesImported += (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
+            const imported = (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
+            totalMessagesImported += imported;
+            this.logger.log(`✅ Lote ${batchNumber}: ${imported} mensagens importadas no banco Chatwoot`);
+          } else {
+            this.logger.warn(`⚠️ Lote ${batchNumber}: Nenhuma mensagem válida para importar no banco`);
           }
         }
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
+        batchNumber++;
       }
 
       this.deleteHistoryMessages(instance);
@@ -336,14 +436,37 @@ class ChatwootImport {
         ignoreJids: Array.isArray(provider.ignoreJids) ? provider.ignoreJids.map((event) => String(event)) : [],
       };
 
-      this.importHistoryContacts(instance, providerData);
-
+      this.logger.log(`👥 Importando contatos do histórico...`);
+      const contactsImported = await this.importHistoryContacts(instance, providerData);
+      
+      this.logger.log(`\n${'='.repeat(60)}`);
+      this.logger.log(`🎉 IMPORTAÇÃO DE HISTÓRICO CONCLUÍDA`);
+      this.logger.log(`${'='.repeat(60)}`);
+      this.logger.log(`📊 Estatísticas:`);
+      this.logger.log(`   • Mensagens importadas: ${totalMessagesImported}`);
+      this.logger.log(`   • Contatos importados: ${contactsImported || 0}`);
+      this.logger.log(`   • Instância: ${instance.instanceName}`);
+      this.logger.log(`${'='.repeat(60)}\n`);
+      
+      // Envia mensagem final pro bot do Chatwoot (só se showBotMessages = true)
+      if (showBotMessages && configService.get<Chatwoot>('CHATWOOT').BOT_CONTACT) {
+        const i18next = await import('@utils/i18n').then(m => m.default);
+        await chatwootService.createBotMessage(
+          instance,
+          i18next.t('cw.import.messagesImported', { totalMessagesImported }),
+          'incoming'
+        ).catch(() => {}); // Ignora erro se falhar
+      }
+      
       return totalMessagesImported;
     } catch (error) {
-      this.logger.error(`Error on import history messages: ${error.toString()}`);
+      this.logger.error(`❌ Erro na importação de histórico: ${error.toString()}`);
+      this.logger.error(`Stack trace: ${error.stack}`);
 
       this.deleteHistoryMessages(instance);
       this.deleteRepositoryMessagesCache(instance);
+      
+      return 0; // Retorna 0 em caso de erro
     }
   }
 

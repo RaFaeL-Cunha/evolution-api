@@ -41,6 +41,103 @@ interface ChatwootMessage {
   isRead?: boolean;
 }
 
+/**
+ * Helper simples para retry com exponential backoff
+ */
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxAttempts: number = 5,
+  operationName: string = 'Operação',
+  baseDelayMs: number = 3000,
+): Promise<T | null> {
+  const logger = new Logger('RetryHelper');
+  
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await fn();
+      
+      if (attempt > 1) {
+        logger.log(`✅ ${operationName} bem-sucedida na tentativa ${attempt}/${maxAttempts}`);
+      }
+      
+      return result;
+    } catch (error) {
+      const errorMsg = error?.message || String(error);
+      
+      if (attempt === maxAttempts) {
+        logger.error(`❌ ${operationName} falhou após ${maxAttempts} tentativas: ${errorMsg}`);
+        return null;
+      }
+      
+      // Exponential backoff: 3s, 6s, 12s, 24s...
+      const delayMs = baseDelayMs * Math.pow(2, attempt - 1);
+      
+      logger.warn(
+        `⚠️ ${operationName} falhou (tentativa ${attempt}/${maxAttempts}): ${errorMsg}. ` +
+        `Tentando novamente em ${delayMs}ms...`
+      );
+      
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  
+  return null;
+}
+
+/**
+ * Cache simples para evitar duplicatas de mensagens
+ */
+class MessageDeduplicationCache {
+  private readonly logger = new Logger('MessageDeduplication');
+  private cache: Map<string, number> = new Map(); // messageId -> timestamp
+  private readonly TTL_MS = 300000; // 5 minutos
+
+  public isDuplicate(messageId: string): boolean {
+    const timestamp = this.cache.get(messageId);
+    
+    if (!timestamp) {
+      return false;
+    }
+    
+    // Verifica se ainda está no TTL
+    if (Date.now() - timestamp > this.TTL_MS) {
+      this.cache.delete(messageId);
+      return false;
+    }
+    
+    this.logger.verbose(`Mensagem duplicada detectada: ${messageId}`);
+    return true;
+  }
+
+  public markAsProcessed(messageId: string): void {
+    this.cache.set(messageId, Date.now());
+    
+    // Limpa cache periodicamente
+    if (this.cache.size > 1000) {
+      this.cleanup();
+    }
+  }
+
+  private cleanup(): void {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    for (const [messageId, timestamp] of this.cache.entries()) {
+      if (now - timestamp > this.TTL_MS) {
+        this.cache.delete(messageId);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      this.logger.verbose(`Limpeza do cache: ${cleaned} mensagens antigas removidas`);
+    }
+  }
+}
+
+// Singleton para cache de deduplicação
+const messageDeduplicationCache = new MessageDeduplicationCache();
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
 
@@ -54,7 +151,9 @@ export class ChatwootService {
     private readonly configService: ConfigService,
     private readonly prismaRepository: PrismaRepository,
     private readonly cache: CacheService,
-  ) { }
+  ) {
+    // Sistema de retry via syncLostMessages (cron a cada 30min)
+  }
 
   private pgClient = postgresClient.getChatwootConnection();
 
@@ -570,11 +669,67 @@ export class ChatwootService {
     return filterPayload;
   }
 
+  /**
+   * Busca conversação existente pelo número de telefone (unifica LID e JID)
+   */
+  private async findExistingConversationByPhone(
+    instance: InstanceDto,
+    phoneNumber: string,
+    inboxId: number
+  ): Promise<number | null> {
+    try {
+      const phoneClean = phoneNumber.split('@')[0].split(':')[0];
+      const contact = await this.findContact(instance, phoneClean);
+      
+      if (!contact) {
+        return null;
+      }
+
+      const client = await this.clientCw(instance);
+      if (!client) {
+        return null;
+      }
+
+      // Busca conversações do contato
+      const conversations = await client.contacts.listConversations({
+        accountId: this.provider.accountId,
+        id: contact.id,
+      }) as any;
+
+      if (!conversations || !conversations.payload) {
+        return null;
+      }
+
+      // Busca conversação aberta ou pendente na inbox correta
+      const existingConversation = conversations.payload.find(
+        (conv: any) => 
+          conv.inbox_id === inboxId && 
+          (conv.status === 'open' || conv.status === 'pending')
+      );
+
+      if (existingConversation) {
+        this.logger.verbose(
+          `✅ Conversação existente encontrada: ID ${existingConversation.id} (status: ${existingConversation.status})`
+        );
+        return existingConversation.id;
+      }
+
+      return null;
+    } catch (error) {
+      this.logger.error(`Erro ao buscar conversação existente: ${error}`);
+      return null;
+    }
+  }
+
   public async createConversation(instance: InstanceDto, body: any) {
-    const isLid = body.key.addressingMode === 'lid';
-    const isGroup = body.key.remoteJid.endsWith('@g.us');
-    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
     const { remoteJid } = body.key;
+    const isGroup = remoteJid.endsWith('@g.us');
+    
+    // 🔧 FIX: Verifica se remoteJid é realmente LID (contém @lid)
+    const isLid = remoteJid.includes('@lid');
+    
+    // Se for LID, usa remoteJidAlt (número normal), senão usa remoteJid
+    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : remoteJid;
     
     if (!phoneNumber && !isGroup) {
       this.logger.warn(
@@ -582,33 +737,58 @@ export class ChatwootService {
       );
     }
     
-    const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
-    const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
+    // 🔧 FIX: Usa phoneNumber como chave para unificar LID e JID normal
+    const normalizedKey = isGroup ? remoteJid : (phoneNumber || remoteJid);
+    const cacheKey = `${instance.instanceName}:createConversation-${normalizedKey}`;
+    const lockKey = `${instance.instanceName}:lock:createConversation-${normalizedKey}`;
+    
+    this.logger.verbose(`🔑 Normalized key: ${normalizedKey} (isLid: ${isLid}, remoteJid: ${remoteJid})`);
     const maxWaitTime = 5000; // 5 seconds
+    
+    // Tenta obter client do Chatwoot
     const client = await this.clientCw(instance);
-    if (!client) return null;
+    if (!client) {
+      this.logger.warn(`⚠️ Client Chatwoot não disponível (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
+      return null;
+    }
 
     try {
-      // Processa atualização de contatos já criados @lid
+      // 🔧 FIX: Processa atualização de contatos quando muda de JID para LID
       if (phoneNumber && remoteJid && !isGroup) {
-        const phoneNumberClean = phoneNumber.split('@')[0];
+        const phoneNumberClean = phoneNumber.split('@')[0].split(':')[0];
+        
+        // Busca contato pelo número de telefone
         const contact = await this.findContact(instance, phoneNumberClean);
-        if (contact && contact.identifier !== remoteJid) {
-          this.logger.verbose(
-            `Identifier needs update: (contact.identifier: ${contact.identifier}, phoneNumber: ${phoneNumber}, body.key.remoteJidAlt: ${remoteJid}`,
-          );
-          const updateContact = await this.updateContact(instance, contact.id, {
-            identifier: phoneNumber,
-            phone_number: `+${phoneNumberClean}`,
-          });
-
-          if (updateContact === null) {
-            const baseContact = await this.findContact(instance, phoneNumberClean);
-            if (baseContact) {
-              await this.mergeContacts(baseContact.id, contact.id);
-              this.logger.verbose(
-                `Merge contacts: (${baseContact.id}) ${baseContact.phone_number} and (${contact.id}) ${contact.phone_number}`,
-              );
+        
+        if (contact) {
+          const needsUpdate = contact.identifier !== phoneNumber;
+          
+          if (needsUpdate) {
+            this.logger.log(
+              `🔄 Atualizando identifier do contato: ${contact.identifier} → ${phoneNumber} (LID: ${isLid})`
+            );
+            
+            try {
+              await this.updateContact(instance, contact.id, {
+                identifier: phoneNumber,
+                phone_number: `+${phoneNumberClean}`,
+              });
+              this.logger.log(`✅ Contato atualizado com sucesso: ${phoneNumberClean}`);
+            } catch (error) {
+              this.logger.warn(`⚠️ Erro ao atualizar contato, tentando merge: ${error}`);
+              
+              // Se falhar, tenta fazer merge de contatos duplicados
+              const baseContact = await this.findContact(instance, phoneNumberClean);
+              if (baseContact && baseContact.id !== contact.id) {
+                try {
+                  await this.mergeContacts(baseContact.id, contact.id);
+                  this.logger.log(
+                    `✅ Contatos mesclados: (${baseContact.id}) ${baseContact.phone_number} ← (${contact.id}) ${contact.phone_number}`
+                  );
+                } catch (mergeError) {
+                  this.logger.error(`❌ Erro ao mesclar contatos: ${mergeError}`);
+                }
+              }
             }
           }
         }
@@ -643,17 +823,34 @@ export class ChatwootService {
 
       // If lock already exists, wait until release or timeout
       if (await this.cache.has(lockKey)) {
-        this.logger.verbose(`Operação de criação já em andamento para ${remoteJid}, aguardando resultado...`);
+        this.logger.warn(`⏳ Lock já existe para ${remoteJid}, aguardando liberação... (instância: ${instance.instanceName})`);
         const start = Date.now();
+        let attempts = 0;
+        
         while (await this.cache.has(lockKey)) {
-          if (Date.now() - start > maxWaitTime) {
-            this.logger.warn(`Timeout aguardando lock para ${remoteJid}`);
+          attempts++;
+          const elapsed = Date.now() - start;
+          
+          if (elapsed > maxWaitTime) {
+            this.logger.error(
+              `❌ TIMEOUT aguardando lock para ${remoteJid} após ${elapsed}ms (${attempts} tentativas) - ` +
+              `Instância: ${instance.instanceName} - Possível deadlock!`
+            );
+            // Força liberação do lock em caso de timeout
+            await this.cache.delete(lockKey);
+            this.logger.warn(`🔓 Lock forçadamente liberado para ${remoteJid}`);
             break;
           }
+          
+          if (attempts % 10 === 0) {
+            this.logger.verbose(`⏳ Ainda aguardando lock ${remoteJid} (${elapsed}ms, ${attempts} tentativas)`);
+          }
+          
           await new Promise((res) => setTimeout(res, this.LOCK_POLLING_DELAY_MS));
+          
           if (await this.cache.has(cacheKey)) {
             const conversationId = (await this.cache.get(cacheKey)) as number;
-            this.logger.verbose(`Resolves creation of: ${remoteJid}, conversation ID: ${conversationId}`);
+            this.logger.log(`✅ Lock resolvido para ${remoteJid}, conversationId: ${conversationId}`);
             return conversationId;
           }
         }
@@ -661,7 +858,7 @@ export class ChatwootService {
 
       // Adquire lock
       await this.cache.set(lockKey, true, 30);
-      this.logger.verbose(`Bloqueio adquirido para: ${lockKey}`);
+      this.logger.log(`🔒 Lock adquirido: ${remoteJid} (instância: ${instance.instanceName}, TTL: 30s)`);
 
       try {
         /*
@@ -674,8 +871,36 @@ export class ChatwootService {
 
         const chatId = isGroup ? remoteJid : phoneNumber?.split('@')[0]?.split(':')[0] || remoteJid.split('@')[0].split(':')[0];
         let nameContact = !body.key.fromMe ? body.pushName : chatId;
-        const filterInbox = await this.getInbox(instance);
-        if (!filterInbox) return null;
+        
+        // ✅ Retry ao buscar inbox (45 segundos)
+        const filterInbox = await retryWithBackoff(
+          async () => await this.getInbox(instance),
+          5,
+          `Buscar inbox no Chatwoot (instance: ${instance.instanceName})`
+        );
+        
+        if (!filterInbox) {
+          this.logger.error('Failed to get inbox after retry');
+          return null;
+        }
+
+        // 🔧 FIX: Verifica se já existe conversação pelo número de telefone (unifica LID e JID)
+        if (!isGroup && phoneNumber) {
+          const existingConversationId = await this.findExistingConversationByPhone(
+            instance,
+            phoneNumber,
+            filterInbox.id
+          );
+          
+          if (existingConversationId) {
+            this.logger.log(
+              `✅ Usando conversação existente: ${existingConversationId} (unificando LID/JID para ${chatId})`
+            );
+            await this.cache.set(cacheKey, existingConversationId, 1800);
+            await this.cache.delete(lockKey);
+            return existingConversationId;
+          }
+        }
 
         if (isGroup) {
           this.logger.verbose(`Processing group conversation`);
@@ -776,10 +1001,17 @@ export class ChatwootService {
         const contactId = contact?.payload?.id || contact?.payload?.contact?.id || contact?.id;
         this.logger.verbose(`Contact ID: ${contactId}`);
 
-        const contactConversations = (await client.contacts.listConversations({
-          accountId: this.provider.accountId,
-          id: contactId,
-        })) as any;
+        // ✅ Retry ao listar conversações do contato (45 segundos)
+        const contactConversations = await retryWithBackoff(
+          async () => {
+            return (await client.contacts.listConversations({
+              accountId: this.provider.accountId,
+              id: contactId,
+            })) as any;
+          },
+          5,
+          `Listar conversações do contato no Chatwoot (contactId: ${contactId})`
+        );
 
         if (!contactConversations || !contactConversations.payload) {
           this.logger.error(`No conversations found or payload is undefined`);
@@ -828,25 +1060,44 @@ export class ChatwootService {
         }
 
 
-        const conversation = await client.conversations.create({
-          accountId: this.provider.accountId,
-          data,
-        });
+        // ✅ Retry ao criar conversação (45 segundos)
+        const conversation = await retryWithBackoff(
+          async () => {
+            return await client.conversations.create({
+              accountId: this.provider.accountId,
+              data,
+            });
+          },
+          5,
+          `Criar conversação no Chatwoot (remoteJid: ${remoteJid})`
+        );
 
+        // ❌ Se falhou após 45 segundos, será recuperado pelo cron
         if (!conversation) {
-          this.logger.warn(`Conversation not created or found`);
+          this.logger.warn(`⚠️ Falha ao criar conversação (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
           return null;
         }
 
         this.logger.verbose(`New conversation created of ${remoteJid} with ID: ${conversation.id}`);
         this.cache.set(cacheKey, conversation.id, 1800);
         return conversation.id;
+      } catch (error) {
+        this.logger.error(`Error in createConversation: ${error}`);
+        
+        // ℹ️ Mensagem será recuperada pelo syncLostMessages (cron 30min)
+        this.logger.warn(`⚠️ Falha ao criar conversação (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
+        
+        return null;
       } finally {
         await this.cache.delete(lockKey);
-        this.logger.verbose(`Block released for: ${lockKey}`);
+        this.logger.log(`🔓 Lock liberado: ${remoteJid} (instância: ${instance.instanceName})`);
       }
     } catch (error) {
-      this.logger.error(`Error in createConversation: ${error}`);
+      this.logger.error(`Error in createConversation (outer): ${error}`);
+      
+      // ℹ️ Mensagem será recuperada pelo syncLostMessages (cron 30min)
+      this.logger.warn(`⚠️ Falha ao criar conversação outer (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
+      
       return null;
     }
   }
@@ -910,24 +1161,32 @@ export class ChatwootService {
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
-    const message = await client.messages.create({
-      accountId: this.provider.accountId,
-      conversationId: conversationId,
-      data: {
-        content: content,
-        message_type: messageType,
-        attachments: attachments,
-        private: privateMessage || false,
-        source_id: sourceId,
-        content_attributes: {
-          ...replyToIds,
-        },
-        source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
+    // ✅ Retry com backoff exponencial (45 segundos)
+    const message = await retryWithBackoff(
+      async () => {
+        return await client.messages.create({
+          accountId: this.provider.accountId,
+          conversationId: conversationId,
+          data: {
+            content: content,
+            message_type: messageType,
+            attachments: attachments,
+            private: privateMessage || false,
+            source_id: sourceId,
+            content_attributes: {
+              ...replyToIds,
+            },
+            source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
+          },
+        });
       },
-    });
+      5,
+      `Criar mensagem no Chatwoot (conversationId: ${conversationId})`
+    );
 
+    // ❌ Se falhou após 45 segundos, será recuperado pelo cron
     if (!message) {
-      this.logger.warn('message not found');
+      this.logger.warn(`⚠️ Falha ao enviar mensagem (conversationId: ${conversationId}) - será recuperada pelo cron`);
       return null;
     }
 
@@ -1074,15 +1333,26 @@ export class ChatwootService {
         ...data.getHeaders(),
       },
       data: data,
+      timeout: 45000, // 🔧 FIX: Timeout de 45s (Chatwoot tem 40s, damos 5s de margem)
     };
 
-    try {
-      const { data } = await axios.request(config);
+    // ✅ Retry ao enviar mídia (45 segundos)
+    const result = await retryWithBackoff(
+      async () => {
+        const response = await axios.request(config);
+        return response.data;
+      },
+      5,
+      `Enviar mídia ao Chatwoot (conversationId: ${conversationId})`
+    );
 
-      return data;
-    } catch (error) {
-      this.logger.error(error);
+    // ❌ Se falhou após 45 segundos, envia pro RabbitMQ
+    if (!result) {
+      this.logger.warn(`⚠️ Falha ao enviar mídia (conversationId: ${conversationId}) - será recuperada pelo cron`);
+      return null;
     }
+
+    return result;
   }
 
   public async createBotQr(
@@ -1373,6 +1643,118 @@ export class ChatwootService {
             }),
             'incoming',
           );
+        }
+
+        if (command === 'sync' || command === 'lost') {
+          await this.createBotMessage(
+            instance,
+            '🔄 Sincronizando mensagens perdidas das últimas 6 horas...',
+            'incoming',
+          );
+
+          try {
+            const chatwootConfig = await waInstance.findChatwoot();
+            const prepare = (message: any) => {
+              // Prepara mensagem (mesmo formato do baileys)
+              return message;
+            };
+            
+            await this.syncLostMessages(instance, chatwootConfig, prepare);
+            
+            await this.createBotMessage(
+              instance,
+              '✅ Sincronização concluída! Verifique se as mensagens apareceram.',
+              'incoming',
+            );
+          } catch (error) {
+            this.logger.error(`Erro ao sincronizar mensagens: ${error}`);
+            await this.createBotMessage(
+              instance,
+              '❌ Erro ao sincronizar mensagens. Tente novamente mais tarde.',
+              'incoming',
+            );
+          }
+        }
+
+        if (command === 'restart' || command === 'reiniciar') {
+          await this.createBotMessage(
+            instance,
+            '🔄 Reiniciando conexão do WhatsApp...',
+            'incoming',
+          );
+
+          try {
+            // Usa o mesmo método do manager (fecha WebSocket + end)
+            if (waInstance?.client) {
+              waInstance.client.ws?.close();
+              waInstance.client.end(new Error('restart'));
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Aguarda 2s
+            
+            await this.createBotMessage(
+              instance,
+              '✅ Reconexão iniciada! Aguarde alguns segundos...',
+              'incoming',
+            );
+          } catch (error) {
+            this.logger.error(`Erro ao reiniciar instância: ${error}`);
+            await this.createBotMessage(
+              instance,
+              '❌ Erro ao reiniciar instância. Tente novamente ou contate o suporte.',
+              'incoming',
+            );
+          }
+        }
+
+        if (command === 'logout' || command === 'sair') {
+          await this.createBotMessage(
+            instance,
+            '⚠️ Desconectando WhatsApp... Você precisará escanear o QR Code novamente.',
+            'incoming',
+          );
+
+          try {
+            // Faz logout completo (desconecta e apaga sessão)
+            await waInstance?.client?.logout();
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Aguarda 2s
+            
+            await this.createBotMessage(
+              instance,
+              '✅ Desconectado! Use /init para gerar um novo QR Code.',
+              'incoming',
+            );
+          } catch (error) {
+            this.logger.error(`Erro ao fazer logout: ${error}`);
+            await this.createBotMessage(
+              instance,
+              '❌ Erro ao desconectar. Tente novamente ou contate o suporte.',
+              'incoming',
+            );
+          }
+        }
+
+        if (command === 'comandos' || command === 'help' || command === 'ajuda') {
+          const helpMessage = `
+📋 **Comandos Disponíveis:**
+
+**Conexão:**
+• \`/init\` ou \`/iniciar\` - Conecta WhatsApp (gera QR Code)
+• \`/status\` - Mostra status da conexão
+
+**Manutenção:**
+• \`/restart\` ou \`/reiniciar\` - Reconecta sem deslogar
+• \`/logout\` ou \`/sair\` - Desconecta completamente (precisa QR Code novo)
+• \`/sync\` ou \`/lost\` - Sincroniza mensagens perdidas (últimas 6h)
+• \`/clearcache\` - Limpa cache da instância
+
+**Ajuda:**
+• \`/comandos\` ou \`/help\` ou \`/ajuda\` - Mostra esta mensagem
+
+💡 **Dica:** Todos os comandos funcionam com ou sem \`/\`
+          `.trim();
+
+          await this.createBotMessage(instance, helpMessage, 'incoming');
         }
 
         if (command === 'status') {
@@ -1988,6 +2370,20 @@ export class ChatwootService {
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
     try {
+      // ✅ Anti-duplicata: Verifica se mensagem já foi processada
+      if (event === Events.MESSAGES_UPSERT && body?.key?.id) {
+        const messageId = `${instance.instanceName}_${body.key.id}`;
+        
+        if (messageDeduplicationCache.isDuplicate(messageId)) {
+          this.logger.verbose(`Mensagem duplicada ignorada: ${body.key.id}`);
+          return null;
+        }
+        
+        // 🔧 FIX: NÃO marca como processada aqui!
+        // Só marca DEPOIS que a mensagem for enviada com sucesso
+        // Caso contrário, se falhar e ir pra fila, não consegue reprocessar
+      }
+
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
       if (!waInstance) {
@@ -2166,6 +2562,13 @@ export class ChatwootService {
               return;
             }
 
+            // ✅ Marca como processada SOMENTE após sucesso
+            if (body?.key?.id) {
+              const messageId = `${instance.instanceName}_${body.key.id}`;
+              messageDeduplicationCache.markAsProcessed(messageId);
+              this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id}`);
+            }
+
             return send;
           } else {
             const send = await this.sendData(
@@ -2183,6 +2586,13 @@ export class ChatwootService {
             if (!send) {
               this.logger.warn('message not sent');
               return;
+            }
+
+            // ✅ Marca como processada SOMENTE após sucesso
+            if (body?.key?.id) {
+              const messageId = `${instance.instanceName}_${body.key.id}`;
+              messageDeduplicationCache.markAsProcessed(messageId);
+              this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id}`);
             }
 
             return send;
@@ -2225,6 +2635,13 @@ export class ChatwootService {
             if (!send) {
               this.logger.warn('message not sent');
               return;
+            }
+
+            // ✅ Marca como processada SOMENTE após sucesso
+            if (body?.key?.id) {
+              const messageId = `${instance.instanceName}_${body.key.id}`;
+              messageDeduplicationCache.markAsProcessed(messageId);
+              this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id}`);
             }
           }
 
@@ -2284,6 +2701,13 @@ export class ChatwootService {
             return;
           }
 
+          // ✅ Marca como processada SOMENTE após sucesso
+          if (body?.key?.id) {
+            const messageId = `${instance.instanceName}_${body.key.id}`;
+            messageDeduplicationCache.markAsProcessed(messageId);
+            this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id}`);
+          }
+
           return send;
         }
 
@@ -2327,6 +2751,13 @@ export class ChatwootService {
             return;
           }
 
+          // ✅ Marca como processada SOMENTE após sucesso
+          if (body?.key?.id) {
+            const messageId = `${instance.instanceName}_${body.key.id}`;
+            messageDeduplicationCache.markAsProcessed(messageId);
+            this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id}`);
+          }
+
           return send;
         } else {
           const send = await this.createMessage(
@@ -2344,6 +2775,13 @@ export class ChatwootService {
           if (!send) {
             this.logger.warn('message not sent');
             return;
+          }
+
+          // ✅ Marca como processada SOMENTE após sucesso
+          if (body?.key?.id) {
+            const messageId = `${instance.instanceName}_${body.key.id}`;
+            messageDeduplicationCache.markAsProcessed(messageId);
+            this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id}`);
           }
 
           return send;
@@ -2498,7 +2936,7 @@ export class ChatwootService {
             const url =
               `/public/api/v1/inboxes/${inbox.inbox_identifier}/contacts/${sourceId}` +
               `/conversations/${conversationId}/update_last_seen`;
-            chatwootRequest(this.getClientCwConfig(), {
+            await chatwootRequest(this.getClientCwConfig(), {
               method: 'POST',
               url: url,
             });
@@ -2586,7 +3024,17 @@ export class ChatwootService {
         }
       }
     } catch (error) {
-      this.logger.error(error);
+      const errorMsg = error?.message || String(error);
+      const messageId = body?.key?.id || 'unknown';
+      
+      this.logger.error(
+        `❌ Erro ao processar evento ${event} (messageId: ${messageId}): ${errorMsg}`
+      );
+      
+      // Log adicional para debug
+      if (error?.response?.data) {
+        this.logger.error(`Resposta da API Chatwoot: ${JSON.stringify(error.response.data)}`);
+      }
     }
   }
 
@@ -2636,6 +3084,7 @@ export class ChatwootService {
       this,
       await this.getInbox(instance),
       this.provider,
+      true, // 🔧 Mostra mensagens do bot ao conectar (QR Code)
     );
     this.updateContactAvatarInRecentConversations(instance);
 
@@ -2761,7 +3210,7 @@ export class ChatwootService {
         messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
       );
 
-      await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider);
+      await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider, false); // 🔧 Não mostra mensagens do bot no cron (silencioso)
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance.clearCacheChatwoot();
     } catch {

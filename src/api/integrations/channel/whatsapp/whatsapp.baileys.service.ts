@@ -1240,25 +1240,43 @@ export class BaileysStartupService extends ChannelStartupService {
     ) => {
       try {
         for (const received of messages) {
+          // 🔧 FIX: Verifica erros de descriptografia (SessionError, Bad MAC, etc.)
+          const decryptionErrors = [
+            'No matching sessions found for message',
+            'Bad MAC',
+            'failed to decrypt message',
+            'SessionError',
+            'Invalid PreKey ID',
+            'No session record',
+            'No session found to decrypt message',
+          ];
+          
+          // Verifica em messageStubParameters
           if (
             received?.messageStubParameters?.some?.((param) =>
-              [
-                'No matching sessions found for message',
-                'Bad MAC',
-                'failed to decrypt message',
-                'SessionError',
-                'Invalid PreKey ID',
-                'No session record',
-                'No session found to decrypt message',
-              ].some((err) => param?.includes?.(err))
+              decryptionErrors.some((err) => param?.includes?.(err))
             )
           ) {
+            const isGroup = received.key?.remoteJid?.includes('@g.us');
+            const errorType = received?.messageStubParameters?.find((param) =>
+              decryptionErrors.some((err) => param?.includes?.(err))
+            );
+            
             this.logger.warn(
-              `Message ignored with messageStubParameters: ${JSON.stringify(
-                received,
-                null,
-                2
-              )}`
+              `⚠️ SessionError - Mensagem não descriptografada: ` +
+              `${isGroup ? 'GRUPO' : 'PRIVADO'} - ` +
+              `${received.key?.remoteJid} - ` +
+              `Erro: ${errorType} - ` +
+              `LID: ${received.key?.addressingMode === 'lid' ? 'SIM' : 'NÃO'}`
+            );
+            continue;
+          }
+          
+          // 🔧 FIX: Verifica se a mensagem tem erro de descriptografia no conteúdo
+          if (!received.message && received.messageStubType) {
+            this.logger.verbose(
+              `⚠️ Mensagem sem conteúdo (messageStubType: ${received.messageStubType}): ` +
+              `${received.key?.remoteJid}`
             );
             continue;
           }
@@ -2449,9 +2467,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      if (!this.endSession) {
-        const database = this.configService.get<Database>('DATABASE');
-        const settings = await this.findSettings();
+      try {
+        if (!this.endSession) {
+          const database = this.configService.get<Database>('DATABASE');
+          const settings = await this.findSettings();
 
         if (events.call) {
           const call = events.call[0];
@@ -2512,8 +2531,8 @@ export class BaileysStartupService extends ChannelStartupService {
                 ].some((err) => param?.includes?.(err))
               )) {
                 this.logger.warn(
-                  `Message filtered due to decryption error: ${msg.key?.id} ` +
-                  `(from: ${msg.key?.participant || msg.key?.remoteJid})`
+                  `Mensagem filtrada devido a erro de descriptografia: ${msg.key?.id} ` +
+                  `(de: ${msg.key?.participant || msg.key?.remoteJid})`
                 );
                 return false;
               }
@@ -2526,7 +2545,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 settings
               );
             } else {
-              this.logger.warn('All messages in batch were filtered due to decryption errors');
+              this.logger.warn('Todas as mensagens do lote foram filtradas devido a erros de descriptografia');
             }
           } catch (error) {
             const errorMsg = error?.message || String(error);
@@ -2534,11 +2553,11 @@ export class BaileysStartupService extends ChannelStartupService {
             // SessionError não deve quebrar o fluxo
             if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
               this.logger.warn(
-                `SessionError caught in eventHandler, continuing: ${errorMsg}`
+                `Erro de sessão capturado no processamento de mensagens, continuando: ${errorMsg}`
               );
             } else {
               // Outros erros são logados mas não quebram o fluxo
-              this.logger.error(`Error processing messages.upsert: ${errorMsg}`);
+              this.logger.error(`Erro ao processar messages.upsert: ${errorMsg}`);
             }
           }
         }
@@ -2636,6 +2655,19 @@ export class BaileysStartupService extends ChannelStartupService {
           this.labelHandle[Events.LABELS_EDIT](payload);
           return;
         }
+        }
+      } catch (error) {
+        const errorMsg = error?.message || String(error);
+        
+        // SessionError é esperado e não deve quebrar o fluxo
+        if (errorMsg.includes('SessionError') || errorMsg.includes('No session record')) {
+          this.logger.warn(
+            `Erro de sessão capturado e ignorado (mensagem não pôde ser descriptografada): ${errorMsg.substring(0, 200)}`
+          );
+        } else {
+          // Outros erros são logados mas não quebram o fluxo
+          this.logger.error(`Erro no processamento de eventos: ${errorMsg}`);
+        }
       }
     });
   }
@@ -2643,11 +2675,17 @@ export class BaileysStartupService extends ChannelStartupService {
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
     const instance: InstanceDto = { instanceName: this.instance.name };
 
+    // 🔧 FIX: Só importa histórico se for syncType === 2 (FULL - primeira conexão após QR code)
+    // syncType 2 = FULL (primeira conexão)
+    // syncType 3 = RECENT (reconexão) - NÃO importa
+    const isFullSync = msg?.syncType === 2;
+    const shouldImport = this.localSettings.syncFullHistory && isFullSync;
+
     if (
       this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
       this.localChatwoot?.enabled &&
       this.localChatwoot.importMessages &&
-      this.isSyncNotificationFromUsedSyncType(msg)
+      shouldImport // ✅ Só importa se for FULL sync E syncFullHistory estiver habilitado
     ) {
       if (msg.chunkOrder === 1) {
         this.chatwootService.startImportHistoryMessages(instance);
@@ -5803,7 +5841,7 @@ export class BaileysStartupService extends ChannelStartupService {
         .getCache()
         ?.hSet(cronKey, this.instance.name, cronId);
 
-      const task = cron.schedule('0,30 * * * *', async () => {
+      const task = cron.schedule('*/10 * * * *', async () => {
         // Check ID before executing (only if cache is available)
         const cache = this.chatwootService.getCache();
         if (cache) {
@@ -6330,6 +6368,7 @@ export class BaileysStartupService extends ChannelStartupService {
         source: true,
         contextInfo: true,
         MessageUpdate: { select: { status: true } },
+        Media: { select: { fileName: true, type: true, mimetype: true } },
       },
     });
 
@@ -6351,6 +6390,17 @@ export class BaileysStartupService extends ChannelStartupService {
           } else if (messageKey.participant) {
             message.pushName = messageKey.participant.split('@')[0];
           }
+        }
+      }
+
+      // Adiciona URL da mídia se existir
+      if (message['Media'] && message['Media'].fileName) {
+        const s3Config = this.configService.get<S3>('S3');
+        if (s3Config.ENABLE) {
+          const protocol = s3Config.USE_SSL ? 'https' : 'http';
+          const port = s3Config.PORT && s3Config.PORT !== 443 && s3Config.PORT !== 80 ? `:${s3Config.PORT}` : '';
+          const endpoint = s3Config.ENDPOINT.replace(/^https?:\/\//, '');
+          message['mediaUrl'] = `${protocol}://${endpoint}${port}/${s3Config.BUCKET_NAME}/${message['Media'].fileName}`;
         }
       }
 

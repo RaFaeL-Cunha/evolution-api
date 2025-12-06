@@ -300,6 +300,7 @@ export class ChannelStartupService {
         url: data.url,
         nameInbox: data.nameInbox,
         signMsg: data.signMsg,
+        signDelimiter: data.signMsg ? data.signDelimiter : null,
         number: data.number,
         reopenConversation: data.reopenConversation,
         conversationPending: data.conversationPending,
