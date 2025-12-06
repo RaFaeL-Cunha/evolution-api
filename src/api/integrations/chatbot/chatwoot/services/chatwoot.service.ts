@@ -152,7 +152,7 @@ export class ChatwootService {
     private readonly prismaRepository: PrismaRepository,
     private readonly cache: CacheService,
   ) {
-    // Sistema de retry via syncLostMessages (cron a cada 30min)
+    // Sistema de retry via syncLostMessages (cron a cada 10min)
   }
 
   private pgClient = postgresClient.getChatwootConnection();
@@ -1142,7 +1142,7 @@ export class ChatwootService {
       } catch (error) {
         this.logger.error(`Error in createConversation: ${error}`);
         
-        // ℹ️ Mensagem será recuperada pelo syncLostMessages (cron 30min)
+        // ℹ️ Mensagem será recuperada pelo syncLostMessages (cron 10min)
         this.logger.warn(`⚠️ Falha ao criar conversação (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
         
         return null;
@@ -1153,7 +1153,7 @@ export class ChatwootService {
     } catch (error) {
       this.logger.error(`Error in createConversation (outer): ${error}`);
       
-      // ℹ️ Mensagem será recuperada pelo syncLostMessages (cron 30min)
+      // ℹ️ Mensagem será recuperada pelo syncLostMessages (cron 10min)
       this.logger.warn(`⚠️ Falha ao criar conversação outer (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
       
       return null;
