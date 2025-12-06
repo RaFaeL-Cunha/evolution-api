@@ -2686,7 +2686,6 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (error) {
           this.logger.error(error);
         }
-        }
       } catch (error) {
         const errorMsg = error?.message || String(error);
         
