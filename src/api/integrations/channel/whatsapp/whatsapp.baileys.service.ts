@@ -5266,7 +5266,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const cronKey = `chatwoot:syncLostMessages`;
       await this.chatwootService.getCache()?.hSet(cronKey, this.instance.name, cronId);
 
-      const task = cron.schedule('*/10 * * * *', async () => {
+      const task = cron.schedule('*/30 * * * *', async () => {
         // Check ID before executing (only if cache is available)
         const cache = this.chatwootService.getCache();
         if (cache) {
