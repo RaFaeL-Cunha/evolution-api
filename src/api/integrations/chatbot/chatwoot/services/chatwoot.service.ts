@@ -1887,29 +1887,57 @@ export class ChatwootService {
                 quoted: await this.getQuotedMessage(body, instance),
               };
 
-              const messageSent = await this.sendAttachment(
-                waInstance,
-                chatId,
-                attachment.data_url,
-                formatText,
-                options,
-              );
-              if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id);
+              // 🛡️ Proteção anti-duplicação para anexos
+              const cacheKey = `cw_sending_${body.id}_${attachment.id || Date.now()}`;
+              const alreadySending = await this.cache.get(cacheKey);
+
+              if (alreadySending) {
+                this.logger.warn(
+                  `[CHATWOOT→WA] Anexo da mensagem ${body.id} já está sendo enviado, ignorando duplicata`,
+                );
+                continue;
               }
 
-              await this.updateChatwootMessageId(
-                {
-                  ...messageSent,
-                },
-                {
-                  messageId: body.id,
-                  inboxId: body.inbox?.id,
-                  conversationId: body.conversation?.id,
-                  contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-                },
-                instance,
-              );
+              await this.cache.set(cacheKey, true, 30);
+
+              let messageSent: any;
+              try {
+                // 🔄 Retry automático para anexos
+                messageSent = await retryWithBackoff(
+                  async () => {
+                    const result = await this.sendAttachment(waInstance, chatId, attachment.data_url, formatText, options);
+                    if (!result) {
+                      throw new Error('Attachment not sent');
+                    }
+                    return result;
+                  },
+                  3,
+                  `Enviar anexo do Chatwoot para WhatsApp (${chatId})`,
+                );
+
+                await this.updateChatwootMessageId(
+                  {
+                    ...messageSent,
+                  },
+                  {
+                    messageId: body.id,
+                    inboxId: body.inbox?.id,
+                    conversationId: body.conversation?.id,
+                    contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+                  },
+                  instance,
+                );
+
+                // ✅ Sucesso! Remove do cache
+                await this.cache.delete(cacheKey);
+              } catch (error) {
+                // ❌ Falhou! Remove do cache
+                await this.cache.delete(cacheKey);
+
+                if (!messageSent && body.conversation?.id) {
+                  this.onSendMessageError(instance, body.conversation?.id, error);
+                }
+              }
             }
           } else {
             const data: SendTextDto = {
@@ -1921,12 +1949,32 @@ export class ChatwootService {
 
             sendTelemetry('/message/sendText');
 
+            // 🛡️ Proteção anti-duplicação
+            const cacheKey = `cw_sending_${body.id}`;
+            const alreadySending = await this.cache.get(cacheKey);
+
+            if (alreadySending) {
+              this.logger.warn(`[CHATWOOT→WA] Mensagem ${body.id} já está sendo enviada, ignorando duplicata`);
+              return { message: 'already_sending' };
+            }
+
+            // Marca como "enviando" por 30 segundos
+            await this.cache.set(cacheKey, true, 30);
+
             let messageSent: any;
             try {
-              messageSent = await waInstance?.textMessage(data, true);
-              if (!messageSent) {
-                throw new Error('Message not sent');
-              }
+              // 🔄 Retry automático: 3 tentativas (~6 segundos total)
+              messageSent = await retryWithBackoff(
+                async () => {
+                  const result = await waInstance?.textMessage(data, true);
+                  if (!result) {
+                    throw new Error('Message not sent');
+                  }
+                  return result;
+                },
+                3,
+                `Enviar mensagem do Chatwoot para WhatsApp (${chatId})`,
+              );
 
               if (Long.isLong(messageSent?.messageTimestamp)) {
                 messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
@@ -1944,7 +1992,13 @@ export class ChatwootService {
                 },
                 instance,
               );
+
+              // ✅ Sucesso! Remove do cache
+              await this.cache.delete(cacheKey);
             } catch (error) {
+              // ❌ Falhou após 3 tentativas! Remove do cache para poder tentar depois
+              await this.cache.delete(cacheKey);
+
               if (!messageSent && body.conversation?.id) {
                 this.onSendMessageError(instance, body.conversation?.id, error);
               }
