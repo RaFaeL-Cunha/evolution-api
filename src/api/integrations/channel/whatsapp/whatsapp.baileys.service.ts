@@ -1272,6 +1272,11 @@ export class BaileysStartupService extends ChannelStartupService {
             const payloadToProcess: any = protocolMsg;
             const keyToSearch: any = payloadToProcess?.key ?? received?.key;
 
+            // Salva mapeamento protocol message para rastreamento (24h cache)
+            if (received.key?.id && keyToSearch?.id) {
+              await this.baileysCache.set(`protocol_${received.key.id}`, keyToSearch.id, 60 * 60 * 24);
+            }
+
             // conteúdo de edição (WhatsApp não recebe placeholder)
             const messageContentUpdate: any = (payloadToProcess as any)?.editedMessage || { conversation: '' };
             const status = 'EDITED';
@@ -1866,6 +1871,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
 
         const cached = await this.baileysCache.get(updateKey);
+        const secondsSinceEpoch = Math.floor(Date.now() / 1000);
 
         if (cached) {
           this.logger.info(`Message duplicated ignored [avoid deadlock]: ${updateKey}`);
@@ -1875,7 +1881,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (update.messageTimestamp) {
           await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
         } else {
-          await this.baileysCache.set(updateKey, Math.floor(Date.now() / 1000), 30 * 60);
+          await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
         }
 
         if (status[update.status] === 'READ' && key.fromMe) {
