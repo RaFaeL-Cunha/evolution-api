@@ -1719,13 +1719,21 @@ export class ChatwootService {
               return message;
             };
 
-            await this.syncLostMessages(instance, chatwootConfig, prepare);
+            const totalSynced = await this.syncLostMessages(instance, chatwootConfig, prepare);
 
-            await this.createBotMessage(
-              instance,
-              '✅ Sincronização concluída! Verifique se as mensagens apareceram.',
-              'incoming',
-            );
+            if (totalSynced > 0) {
+              await this.createBotMessage(
+                instance,
+                `✅ Sincronização concluída! ${totalSynced} mensagem(ns) foram sincronizadas.`,
+                'incoming',
+              );
+            } else {
+              await this.createBotMessage(
+                instance,
+                '✅ Nenhuma mensagem perdida encontrada. Tudo está sincronizado!',
+                'incoming',
+              );
+            }
           } catch (error) {
             this.logger.error(`Erro ao sincronizar mensagens: ${error}`);
             await this.createBotMessage(
@@ -3350,11 +3358,13 @@ export class ChatwootService {
         messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
       );
 
-      await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider, false); // 🔧 Não mostra mensagens do bot no cron (silencioso)
+      const totalImported = await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider, false); // 🔧 Não mostra mensagens do bot no cron (silencioso)
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance.clearCacheChatwoot();
+      
+      return totalImported || 0;
     } catch {
-      return;
+      return 0;
     }
   }
 }
