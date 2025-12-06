@@ -1742,10 +1742,13 @@ export class ChatwootService {
           );
 
           try {
-            // Usa o mesmo método do manager (fecha WebSocket + end)
-            if (waInstance?.client) {
-              waInstance.client.ws?.close();
-              waInstance.client.end(new Error('restart'));
+            // Usa o mesmo método do endpoint /instance/restart
+            if (typeof waInstance.restart === 'function') {
+              await waInstance.restart();
+            } else {
+              // Fallback para Baileys
+              waInstance.client?.ws?.close();
+              waInstance.client?.end(new Error('restart'));
             }
             
             await new Promise(resolve => setTimeout(resolve, 2000)); // Aguarda 2s
