@@ -49,7 +49,7 @@ async function retryWithBackoff<T>(
   maxAttempts: number = 5,
   operationName: string = 'Operação',
   baseDelayMs: number = 3000,
-): Promise<T | null> {
+): Promise<T> {
   const logger = new Logger('RetryHelper');
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -66,7 +66,7 @@ async function retryWithBackoff<T>(
 
       if (attempt === maxAttempts) {
         logger.error(`❌ ${operationName} falhou após ${maxAttempts} tentativas: ${errorMsg}`);
-        return null;
+        throw new Error(`Failed after ${maxAttempts} attempts: ${operationName} - ${errorMsg}`);
       }
 
       // Exponential backoff: 3s, 6s, 12s, 24s...
@@ -81,7 +81,7 @@ async function retryWithBackoff<T>(
     }
   }
 
-  return null;
+  throw new Error(`Failed after ${maxAttempts} attempts: ${operationName}`);
 }
 
 /**
@@ -935,15 +935,14 @@ export class ChatwootService {
 
         // ✅ Retry ao buscar inbox (45 segundos)
         const filterInbox = await retryWithBackoff(
-          async () => await this.getInbox(instance),
+          async () => {
+            const inbox = await this.getInbox(instance);
+            if (!inbox) throw new Error('Inbox not found');
+            return inbox;
+          },
           5,
           `Buscar inbox no Chatwoot (instance: ${instance.instanceName})`,
         );
-
-        if (!filterInbox) {
-          this.logger.error('Failed to get inbox after retry');
-          return null;
-        }
 
         // 🔧 FIX: Verifica se já existe conversação pelo número de telefone (unifica LID e JID)
         if (!isGroup && phoneNumber) {
@@ -1064,19 +1063,18 @@ export class ChatwootService {
         // ✅ Retry ao listar conversações do contato (45 segundos)
         const contactConversations = await retryWithBackoff(
           async () => {
-            return (await client.contacts.listConversations({
+            const conversations = (await client.contacts.listConversations({
               accountId: this.provider.accountId,
               id: contactId,
             })) as any;
+            if (!conversations || !conversations.payload) {
+              throw new Error('No conversations found or payload is undefined');
+            }
+            return conversations;
           },
           5,
           `Listar conversações do contato no Chatwoot (contactId: ${contactId})`,
         );
-
-        if (!contactConversations || !contactConversations.payload) {
-          this.logger.error(`No conversations found or payload is undefined`);
-          return null;
-        }
 
         let inboxConversation = contactConversations.payload.find(
           (conversation) => conversation.inbox_id == filterInbox.id,
@@ -1122,20 +1120,16 @@ export class ChatwootService {
         // ✅ Retry ao criar conversação (45 segundos)
         const conversation = await retryWithBackoff(
           async () => {
-            return await client.conversations.create({
+            const conv = await client.conversations.create({
               accountId: this.provider.accountId,
               data,
             });
+            if (!conv) throw new Error('Failed to create conversation');
+            return conv;
           },
           5,
           `Criar conversação no Chatwoot (remoteJid: ${remoteJid})`,
         );
-
-        // ❌ Se falhou após 45 segundos, será recuperado pelo cron
-        if (!conversation) {
-          this.logger.warn(`⚠️ Falha ao criar conversação (remoteJid: ${remoteJid}) - será recuperada pelo cron`);
-          return null;
-        }
 
         this.logger.verbose(`New conversation created of ${remoteJid} with ID: ${conversation.id}`);
         this.cache.set(cacheKey, conversation.id, 1800);
@@ -1208,7 +1202,6 @@ export class ChatwootService {
     messageBody?: any,
     sourceId?: string,
     quotedMsg?: MessageModel,
-    timestamp?: number, // Timestamp em segundos (Unix timestamp)
   ) {
     const client = await this.clientCw(instance);
 
@@ -1224,7 +1217,7 @@ export class ChatwootService {
     // ✅ Retry com backoff exponencial (45 segundos)
     const message = await retryWithBackoff(
       async () => {
-        return await client.messages.create({
+        const msg = await client.messages.create({
           accountId: this.provider.accountId,
           conversationId: conversationId,
           data: {
@@ -1239,16 +1232,12 @@ export class ChatwootService {
             source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
           },
         });
+        if (!msg) throw new Error('Failed to create message');
+        return msg;
       },
       5,
       `Criar mensagem no Chatwoot (conversationId: ${conversationId})`,
     );
-
-    // ❌ Se falhou após 45 segundos, será recuperado pelo cron
-    if (!message) {
-      this.logger.warn(`⚠️ Falha ao enviar mensagem (conversationId: ${conversationId}) - será recuperada pelo cron`);
-      return null;
-    }
 
     return message;
   }
@@ -1400,17 +1389,12 @@ export class ChatwootService {
     const result = await retryWithBackoff(
       async () => {
         const response = await axios.request(config);
+        if (!response.data) throw new Error('No data in response');
         return response.data;
       },
       5,
       `Enviar mídia ao Chatwoot (conversationId: ${conversationId})`,
     );
-
-    // ❌ Se falhou após 45 segundos, envia pro RabbitMQ
-    if (!result) {
-      this.logger.warn(`⚠️ Falha ao enviar mídia (conversationId: ${conversationId}) - será recuperada pelo cron`);
-      return null;
-    }
 
     return result;
   }
@@ -1887,31 +1871,24 @@ export class ChatwootService {
                 quoted: await this.getQuotedMessage(body, instance),
               };
 
-              // 🛡️ Proteção anti-duplicação para anexos
-              const cacheKey = `cw_sending_${body.id}_${attachment.id || Date.now()}`;
-              const alreadySending = await this.cache.get(cacheKey);
-
-              if (alreadySending) {
-                this.logger.warn(
-                  `[CHATWOOT→WA] Anexo da mensagem ${body.id} já está sendo enviado, ignorando duplicata`,
-                );
-                continue;
-              }
-
-              await this.cache.set(cacheKey, true, 30);
-
               let messageSent: any;
               try {
-                // 🔄 Retry automático para anexos
+                // 🔄 Retry automático para anexos (5 tentativas = ~93 segundos)
                 messageSent = await retryWithBackoff(
                   async () => {
-                    const result = await this.sendAttachment(waInstance, chatId, attachment.data_url, formatText, options);
+                    const result = await this.sendAttachment(
+                      waInstance,
+                      chatId,
+                      attachment.data_url,
+                      formatText,
+                      options,
+                    );
                     if (!result) {
                       throw new Error('Attachment not sent');
                     }
                     return result;
                   },
-                  3,
+                  5,
                   `Enviar anexo do Chatwoot para WhatsApp (${chatId})`,
                 );
 
@@ -1927,16 +1904,11 @@ export class ChatwootService {
                   },
                   instance,
                 );
-
-                // ✅ Sucesso! Remove do cache
-                await this.cache.delete(cacheKey);
               } catch (error) {
-                // ❌ Falhou! Remove do cache
-                await this.cache.delete(cacheKey);
-
                 if (!messageSent && body.conversation?.id) {
                   this.onSendMessageError(instance, body.conversation?.id, error);
                 }
+                throw error;
               }
             }
           } else {
@@ -1949,21 +1921,9 @@ export class ChatwootService {
 
             sendTelemetry('/message/sendText');
 
-            // 🛡️ Proteção anti-duplicação
-            const cacheKey = `cw_sending_${body.id}`;
-            const alreadySending = await this.cache.get(cacheKey);
-
-            if (alreadySending) {
-              this.logger.warn(`[CHATWOOT→WA] Mensagem ${body.id} já está sendo enviada, ignorando duplicata`);
-              return { message: 'already_sending' };
-            }
-
-            // Marca como "enviando" por 30 segundos
-            await this.cache.set(cacheKey, true, 30);
-
             let messageSent: any;
             try {
-              // 🔄 Retry automático: 3 tentativas (~6 segundos total)
+              // 🔄 Retry automático: 5 tentativas (~93 segundos total)
               messageSent = await retryWithBackoff(
                 async () => {
                   const result = await waInstance?.textMessage(data, true);
@@ -1972,7 +1932,7 @@ export class ChatwootService {
                   }
                   return result;
                 },
-                3,
+                5,
                 `Enviar mensagem do Chatwoot para WhatsApp (${chatId})`,
               );
 
@@ -1992,13 +1952,7 @@ export class ChatwootService {
                 },
                 instance,
               );
-
-              // ✅ Sucesso! Remove do cache
-              await this.cache.delete(cacheKey);
             } catch (error) {
-              // ❌ Falhou após 3 tentativas! Remove do cache para poder tentar depois
-              await this.cache.delete(cacheKey);
-
               if (!messageSent && body.conversation?.id) {
                 this.onSendMessageError(instance, body.conversation?.id, error);
               }
@@ -2331,7 +2285,7 @@ export class ChatwootService {
 
         // Generic interactive message
         return '📱 *Mensagem interativa*\n\n_Esta mensagem contém botões ou elementos interativos. Visualize no celular para interagir._';
-      } catch (error) {
+      } catch {
         return '📱 *Mensagem interativa*\n\n_Esta mensagem contém elementos interativos. Visualize no celular._';
       }
     }
@@ -3415,7 +3369,7 @@ export class ChatwootService {
       const totalImported = await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider, false); // 🔧 Não mostra mensagens do bot no cron (silencioso)
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance.clearCacheChatwoot();
-      
+
       return totalImported || 0;
     } catch {
       return 0;
