@@ -2436,10 +2436,22 @@ export class ChatwootService {
     return result;
   }
 
-  public getConversationMessage(msg: any) {
+  public getConversationMessage(msg: any, fullMessage?: any) {
     const types = this.getTypeMessage(msg);
 
-    const messageContent = this.getMessageContent(types);
+    let messageContent = this.getMessageContent(types);
+
+    // ✅ Adiciona indicador de mensagem encaminhada
+    const isForwarded = fullMessage?.isForwarded || msg?.isForwarded;
+    const forwardingScore = fullMessage?.forwardingScore || msg?.forwardingScore;
+
+    if (isForwarded) {
+      const forwardCount = forwardingScore || 1;
+      const forwardIndicator = forwardCount > 1 ? `↪️ _Encaminhada ${forwardCount}x_\n\n` : `↪️ _Encaminhada_\n\n`;
+
+      this.logger.log(`✅ Mensagem encaminhada detectada (score: ${forwardCount})`);
+      messageContent = forwardIndicator + messageContent;
+    }
 
     return messageContent;
   }
@@ -2516,7 +2528,8 @@ export class ChatwootService {
           };
         }
 
-        const originalMessage = await this.getConversationMessage(body.message);
+        const originalMessage = await this.getConversationMessage(body.message, body);
+
         const bodyMessage = originalMessage
           ? originalMessage
               .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')

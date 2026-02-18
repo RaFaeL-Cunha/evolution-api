@@ -1438,6 +1438,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const messageRaw = this.prepareMessage(received);
 
+          // ✅ Preserva campos de encaminhamento do contextInfo
+          const contentType = getContentType(received.message);
+          const contentMsg = received?.message?.[contentType] as any;
+          const msgContextInfo = contentMsg?.contextInfo;
+
+          if (msgContextInfo?.isForwarded) {
+            (messageRaw as any).isForwarded = msgContextInfo.isForwarded;
+            (messageRaw as any).forwardingScore = msgContextInfo.forwardingScore || 1;
+            this.logger.verbose(
+              `✅ Mensagem encaminhada detectada - isForwarded: ${msgContextInfo.isForwarded}, forwardingScore: ${msgContextInfo.forwardingScore}`,
+            );
+          }
+
           // Converter menções de LID em números de telefone legíveis com nomes de contato
           // Em vez de @176407292411998, os usuários verão @5511951279027 - Henrique Nord
           // Funciona tanto para mensagens recebidas quanto enviadas
@@ -1632,8 +1645,11 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+            // Remove campos que não existem no schema do Prisma antes de salvar
+            const { isForwarded, forwardingScore, ...messageToSave } = messageRaw as any;
+
             const msg = await this.prismaRepository.message.create({
-              data: messageRaw,
+              data: messageToSave,
             });
 
             const { remoteJid } = received.key;
