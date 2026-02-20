@@ -614,7 +614,7 @@ class ChatwootImport {
   }
 
   public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {
-    const contentMessage = chatwootService.getConversationMessage(msg.message);
+    const contentMessage = chatwootService.getConversationMessage(msg.message, msg);
     if (contentMessage) {
       return contentMessage;
     }

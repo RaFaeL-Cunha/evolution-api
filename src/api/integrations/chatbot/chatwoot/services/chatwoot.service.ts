@@ -42,15 +42,24 @@ interface ChatwootMessage {
 }
 
 /**
- * Helper simples para retry com exponential backoff
+ * Helper simples para retry com backoff customizado
+ * Opção Balanceada: 4 retries em ~30s (dentro do timeout de 40s do Chatwoot)
+ * Tentativa 1: imediato
+ * Tentativa 2: +3s (total: 3s)
+ * Tentativa 3: +6s (total: 9s)
+ * Tentativa 4: +10s (total: 19s)
+ * Tentativa 5: +10s (total: 29s)
  */
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   maxAttempts: number = 5,
   operationName: string = 'Operação',
-  baseDelayMs: number = 3000,
+  baseDelayMs: number = 3000, // Não usado mais, mantido para compatibilidade
 ): Promise<T> {
   const logger = new Logger('RetryHelper');
+
+  // Delays customizados para ficar dentro de 30s
+  const delays = [0, 3000, 6000, 10000, 10000]; // 0s, 3s, 6s, 10s, 10s
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -69,8 +78,7 @@ async function retryWithBackoff<T>(
         throw new Error(`Failed after ${maxAttempts} attempts: ${operationName} - ${errorMsg}`);
       }
 
-      // Exponential backoff: 3s, 6s, 12s, 24s...
-      const delayMs = baseDelayMs * Math.pow(2, attempt - 1);
+      const delayMs = delays[attempt] || 10000; // Fallback para 10s
 
       logger.warn(
         `⚠️ ${operationName} falhou (tentativa ${attempt}/${maxAttempts}): ${errorMsg}. ` +
@@ -1873,7 +1881,7 @@ export class ChatwootService {
 
               let messageSent: any;
               try {
-                // 🔄 Retry automático para anexos (5 tentativas = ~93 segundos)
+                // 🔄 Retry automático para anexos (5 tentativas = ~29 segundos)
                 messageSent = await retryWithBackoff(
                   async () => {
                     const result = await this.sendAttachment(
@@ -1923,7 +1931,7 @@ export class ChatwootService {
 
             let messageSent: any;
             try {
-              // 🔄 Retry automático: 5 tentativas (~93 segundos total)
+              // 🔄 Retry automático: 5 tentativas (~29 segundos total)
               messageSent = await retryWithBackoff(
                 async () => {
                   const result = await waInstance?.textMessage(data, true);
@@ -2022,7 +2030,8 @@ export class ChatwootService {
     } catch (error) {
       this.logger.error(error);
 
-      return { message: 'bot' };
+      // ❌ Retorna erro para o Chatwoot mostrar botão de reenvio
+      throw error;
     }
   }
 
