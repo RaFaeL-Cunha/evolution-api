@@ -43,23 +43,22 @@ interface ChatwootMessage {
 
 /**
  * Helper simples para retry com backoff customizado
- * Opção Balanceada: 4 retries em ~30s (dentro do timeout de 40s do Chatwoot)
+ * Opção Balanceada: 4 retries em ~20s (dentro do timeout de 40s do Chatwoot)
  * Tentativa 1: imediato
  * Tentativa 2: +3s (total: 3s)
  * Tentativa 3: +6s (total: 9s)
  * Tentativa 4: +10s (total: 19s)
- * Tentativa 5: +10s (total: 29s)
  */
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
-  maxAttempts: number = 5,
+  maxAttempts: number = 4,
   operationName: string = 'Operação',
   baseDelayMs: number = 3000, // Não usado mais, mantido para compatibilidade
 ): Promise<T> {
   const logger = new Logger('RetryHelper');
 
-  // Delays customizados para ficar dentro de 30s
-  const delays = [0, 3000, 6000, 10000, 10000]; // 0s, 3s, 6s, 10s, 10s
+  // Delays customizados para ficar dentro de 20s
+  const delays = [0, 3000, 6000, 10000]; // 0s, 3s, 6s, 10s
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -1700,7 +1699,7 @@ export class ChatwootService {
         if (command === 'sync' || command === 'lost') {
           await this.createBotMessage(
             instance,
-            '🔄 Sincronizando mensagens perdidas das últimas 6 horas...',
+            '🔄 Sincronizando mensagens perdidas das últimas 10 horas...',
             'incoming',
           );
 
@@ -1881,7 +1880,7 @@ export class ChatwootService {
 
               let messageSent: any;
               try {
-                // 🔄 Retry automático para anexos (5 tentativas = ~29 segundos)
+                // 🔄 Retry automático para anexos (4 tentativas = ~19 segundos)
                 messageSent = await retryWithBackoff(
                   async () => {
                     const result = await this.sendAttachment(
@@ -1931,7 +1930,7 @@ export class ChatwootService {
 
             let messageSent: any;
             try {
-              // 🔄 Retry automático: 5 tentativas (~29 segundos total)
+              // 🔄 Retry automático: 4 tentativas (~19 segundos total)
               messageSent = await retryWithBackoff(
                 async () => {
                   const result = await waInstance?.textMessage(data, true);
@@ -3351,7 +3350,7 @@ export class ChatwootService {
       const sqlMessages = `select * from messages m
       where account_id = ${chatwootConfig.accountId}
       and inbox_id = ${inbox.id}
-      and created_at >= now() - interval '6h'
+      and created_at >= now() - interval '10h'
       order by created_at desc`;
 
       const messagesData = (await this.pgClient.query(sqlMessages))?.rows;
@@ -3362,7 +3361,7 @@ export class ChatwootService {
       const savedMessages = await this.prismaRepository.message.findMany({
         where: {
           Instance: { name: instance.instanceName },
-          messageTimestamp: { gte: Number(dayjs().subtract(6, 'hours').unix()) },
+          messageTimestamp: { gte: Number(dayjs().subtract(10, 'hours').unix()) },
           AND: ids.map((id) => ({ key: { path: ['id'], not: id } })),
         },
       });

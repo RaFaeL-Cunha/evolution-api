@@ -578,7 +578,17 @@ class ChatwootImport {
         remoteJid: string;
       };
       if (!this.isIgnorePhoneNumber(key?.remoteJid)) {
-        const phoneNumber = key?.remoteJid?.split('@')[0];
+        let phoneNumber = key?.remoteJid?.split('@')[0];
+
+        // 🔧 Se for LID, tenta converter para número real
+        // LIDs não são números de telefone válidos e causam erro na importação
+        if (key?.remoteJid?.includes('@lid')) {
+          this.logger.verbose(
+            `⚠️ Mensagem com LID detectada: ${key.remoteJid} - pulando importação (LID não pode ser convertido)`,
+          );
+          return acc; // Pula mensagens com LID
+        }
+
         if (phoneNumber) {
           const phoneNumberPlus = `+${phoneNumber}`;
           const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
