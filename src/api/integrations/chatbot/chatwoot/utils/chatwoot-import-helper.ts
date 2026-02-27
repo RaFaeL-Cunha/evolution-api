@@ -225,6 +225,7 @@ class ChatwootImport {
     inbox: inbox,
     provider: ChatwootModel,
     showBotMessages: boolean = true, // 🔧 Controla se mostra mensagens pro bot
+    prismaRepository?: any, // 🔧 Para converter LIDs
   ) {
     try {
       this.logger.log(`📥 Iniciando importação de histórico para ${instance.instanceName}`);
@@ -271,7 +272,10 @@ class ChatwootImport {
         return parseInt(aKey.remoteJid) - parseInt(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
-      const allMessagesMappedByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesOrdered);
+      const allMessagesMappedByPhoneNumber = await this.createMessagesMapByPhoneNumber(
+        messagesOrdered,
+        prismaRepository,
+      );
       // Map structure: +552199999999 => { first message timestamp from number, last message timestamp from number}
       const phoneNumbersWithTimestamp = new Map<string, firstLastTimestamp>();
       allMessagesMappedByPhoneNumber.forEach((messages: Message[], phoneNumber: string) => {
@@ -320,7 +324,7 @@ class ChatwootImport {
       while (messagesChunk.length > 0) {
         this.logger.log(`📦 Processando lote ${batchNumber}/${totalBatches} (${messagesChunk.length} mensagens)`);
         // Map structure: +552199999999 => Message[]
-        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk);
+        const messagesByPhoneNumber = await this.createMessagesMapByPhoneNumber(messagesChunk, prismaRepository);
 
         if (messagesByPhoneNumber.size > 0) {
           const fksByNumber = await this.selectOrCreateFksFromChatwoot(
@@ -572,33 +576,67 @@ class ChatwootImport {
     }
   }
 
-  public createMessagesMapByPhoneNumber(messages: Message[]): Map<string, Message[]> {
-    return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
+  public async createMessagesMapByPhoneNumber(
+    messages: Message[],
+    prismaRepository?: any,
+  ): Promise<Map<string, Message[]>> {
+    const acc = new Map<string, Message[]>();
+
+    for (const message of messages) {
       const key = message?.key as {
         remoteJid: string;
+        remoteJidAlt?: string;
       };
-      if (!this.isIgnorePhoneNumber(key?.remoteJid)) {
-        let phoneNumber = key?.remoteJid?.split('@')[0];
 
-        // 🔧 Se for LID, tenta converter para número real
-        // LIDs não são números de telefone válidos e causam erro na importação
-        if (key?.remoteJid?.includes('@lid')) {
+      if (this.isIgnorePhoneNumber(key?.remoteJid)) {
+        continue;
+      }
+
+      let phoneNumber = key?.remoteJid?.split('@')[0];
+
+      // 🔧 Se for LID, tenta buscar número real no cache IsOnWhatsapp
+      if (key?.remoteJid?.includes('@lid')) {
+        // Primeiro tenta usar remoteJidAlt se existir
+        if (key.remoteJidAlt && !key.remoteJidAlt.includes('@lid')) {
+          phoneNumber = key.remoteJidAlt.split('@')[0];
+          this.logger.verbose(`✅ LID convertido usando remoteJidAlt: ${key.remoteJid} → ${key.remoteJidAlt}`);
+        } else if (prismaRepository) {
+          // Busca no cache IsOnWhatsapp
+          try {
+            const cached = await prismaRepository.isOnWhatsapp.findFirst({
+              where: {
+                OR: [{ jidOptions: { contains: key.remoteJid } }, { remoteJid: key.remoteJid }],
+              },
+            });
+
+            if (cached?.remoteJid && !cached.remoteJid.includes('@lid')) {
+              phoneNumber = cached.remoteJid.split('@')[0];
+              this.logger.verbose(`✅ LID convertido usando cache: ${key.remoteJid} → ${cached.remoteJid}`);
+            } else {
+              this.logger.verbose(`⚠️ LID sem conversão disponível: ${key.remoteJid} - pulando importação`);
+              continue;
+            }
+          } catch {
+            this.logger.verbose(`⚠️ Erro ao buscar LID no cache: ${key.remoteJid} - pulando importação`);
+            continue;
+          }
+        } else {
           this.logger.verbose(
-            `⚠️ Mensagem com LID detectada: ${key.remoteJid} - pulando importação (LID não pode ser convertido)`,
+            `⚠️ Mensagem com LID detectada: ${key.remoteJid} - pulando importação (sem acesso ao cache)`,
           );
-          return acc; // Pula mensagens com LID
-        }
-
-        if (phoneNumber) {
-          const phoneNumberPlus = `+${phoneNumber}`;
-          const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
-          messages.push(message);
-          acc.set(phoneNumberPlus, messages);
+          continue;
         }
       }
 
-      return acc;
-    }, new Map());
+      if (phoneNumber) {
+        const phoneNumberPlus = `+${phoneNumber}`;
+        const msgs = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
+        msgs.push(message);
+        acc.set(phoneNumberPlus, msgs);
+      }
+    }
+
+    return acc;
   }
 
   public async getContactsOrderByRecentConversations(

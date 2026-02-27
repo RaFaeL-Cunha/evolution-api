@@ -53,7 +53,6 @@ async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   maxAttempts: number = 4,
   operationName: string = 'Operação',
-  baseDelayMs: number = 3000, // Não usado mais, mantido para compatibilidade
 ): Promise<T> {
   const logger = new Logger('RetryHelper');
 
@@ -1637,6 +1636,8 @@ export class ChatwootService {
       instance.instanceId = waInstance.instanceId;
 
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
+        this.logger.verbose(`🗑️ Tentando deletar mensagem - Chatwoot ID: ${body.id}`);
+
         const message = await this.prismaRepository.message.findFirst({
           where: {
             chatwootMessageId: body.id,
@@ -1644,14 +1645,22 @@ export class ChatwootService {
           },
         });
 
-        if (message) {
-          const key = message.key as WAMessageKey;
+        if (!message) {
+          this.logger.warn(`⚠️ Mensagem não encontrada no banco para deletar - Chatwoot ID: ${body.id}`);
+          return { message: 'bot' };
+        }
 
+        const key = message.key as WAMessageKey;
+        this.logger.verbose(`🗑️ Deletando mensagem - Key: ${JSON.stringify(key)}, Type: ${message.messageType}`);
+
+        try {
           // Delete for everyone (both mobile and WhatsApp Web)
           await waInstance?.client.sendMessage(key.remoteJid, {
             delete: key,
             revoke: true,
           });
+
+          this.logger.log(`✅ Mensagem deletada no WhatsApp - ID: ${key.id}, Type: ${message.messageType}`);
 
           await this.prismaRepository.message.deleteMany({
             where: {
@@ -1659,7 +1668,20 @@ export class ChatwootService {
               chatwootMessageId: body.id,
             },
           });
+        } catch (error) {
+          this.logger.error(`❌ Erro ao deletar mensagem no WhatsApp: ${error.message}`);
+          this.logger.error(`   Key: ${JSON.stringify(key)}`);
+          this.logger.error(`   Type: ${message.messageType}`);
+
+          // Mesmo com erro, remove do banco para não ficar inconsistente
+          await this.prismaRepository.message.deleteMany({
+            where: {
+              instanceId: instance.instanceId,
+              chatwootMessageId: body.id,
+            },
+          });
         }
+
         return { message: 'bot' };
       }
 
@@ -3262,6 +3284,7 @@ export class ChatwootService {
       await this.getInbox(instance),
       this.provider,
       true, // 🔧 Mostra mensagens do bot ao conectar (QR Code)
+      this.prismaRepository, // 🔧 Para converter LIDs
     );
     this.updateContactAvatarInRecentConversations(instance);
 
@@ -3387,7 +3410,14 @@ export class ChatwootService {
         messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
       );
 
-      const totalImported = await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider, false); // 🔧 Não mostra mensagens do bot no cron (silencioso)
+      const totalImported = await chatwootImport.importHistoryMessages(
+        instance,
+        this,
+        inbox,
+        this.provider,
+        false, // 🔧 Não mostra mensagens do bot no cron (silencioso)
+        this.prismaRepository, // 🔧 Para converter LIDs
+      );
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance.clearCacheChatwoot();
 
