@@ -359,7 +359,11 @@ export class ChannelStartupService {
 
   public clearCacheChatwoot() {
     if (this.localChatwoot?.enabled) {
+      this.logger.log(`[clearCacheChatwoot] Deletando todo cache da instância ${this.instanceName}`);
       this.chatwootService.getCache()?.deleteAll(this.instanceName);
+      this.logger.log(`[clearCacheChatwoot] Cache deletado com sucesso`);
+    } else {
+      this.logger.warn(`[clearCacheChatwoot] Chatwoot não está habilitado para ${this.instanceName}`);
     }
   }
 

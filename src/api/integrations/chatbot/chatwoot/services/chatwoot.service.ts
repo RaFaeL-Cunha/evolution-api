@@ -43,11 +43,11 @@ interface ChatwootMessage {
 
 /**
  * Helper simples para retry com backoff customizado
- * Opção Balanceada: 4 retries em ~20s (dentro do timeout de 40s do Chatwoot)
+ * Opção Balanceada: 4 retries em ~25s (dentro do timeout de 40s do Chatwoot)
  * Tentativa 1: imediato
- * Tentativa 2: +3s (total: 3s)
- * Tentativa 3: +6s (total: 9s)
- * Tentativa 4: +10s (total: 19s)
+ * Tentativa 2: +5s (total: 5s)
+ * Tentativa 3: +8s (total: 13s)
+ * Tentativa 4: +12s (total: 25s)
  */
 async function retryWithBackoff<T>(
   fn: () => Promise<T>,
@@ -56,8 +56,8 @@ async function retryWithBackoff<T>(
 ): Promise<T> {
   const logger = new Logger('RetryHelper');
 
-  // Delays customizados para ficar dentro de 20s
-  const delays = [0, 3000, 6000, 10000]; // 0s, 3s, 6s, 10s
+  // Delays customizados para ficar dentro de 25s
+  const delays = [0, 5000, 8000, 12000]; // 0s, 5s, 8s, 12s
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -70,17 +70,25 @@ async function retryWithBackoff<T>(
       return result;
     } catch (error) {
       const errorMsg = error?.message || String(error);
+      const errorStatus = error?.status || error?.response?.status || 'unknown';
 
       if (attempt === maxAttempts) {
-        logger.error(`❌ ${operationName} falhou após ${maxAttempts} tentativas: ${errorMsg}`);
+        logger.error(
+          `❌ ${operationName} falhou após ${maxAttempts} tentativas:\n` +
+            `  Erro: ${errorMsg}\n` +
+            `  Status: ${errorStatus}\n` +
+            `  Tipo: ${error?.code || 'unknown'}`,
+        );
         throw new Error(`Failed after ${maxAttempts} attempts: ${operationName} - ${errorMsg}`);
       }
 
-      const delayMs = delays[attempt] || 10000; // Fallback para 10s
+      const delayMs = delays[attempt] || 12000; // Fallback para 12s
 
       logger.warn(
-        `⚠️ ${operationName} falhou (tentativa ${attempt}/${maxAttempts}): ${errorMsg}. ` +
-          `Tentando novamente em ${delayMs}ms...`,
+        `⚠️ ${operationName} falhou (tentativa ${attempt}/${maxAttempts}):\n` +
+          `  Erro: ${errorMsg}\n` +
+          `  Status: ${errorStatus}\n` +
+          `  Aguardando ${delayMs}ms antes da próxima tentativa...`,
       );
 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -1592,6 +1600,18 @@ export class ChatwootService {
   }
 
   public async receiveWebhook(instance: InstanceDto, body: any) {
+    // 🔍 DEBUG: Log de TODOS os webhooks recebidos
+    if (body.event === 'message_updated' && body.content_attributes?.deleted) {
+      this.logger.log(
+        `🔔 WEBHOOK DELETE RECEBIDO:\n` +
+          `  Event: ${body.event}\n` +
+          `  Message ID: ${body.id}\n` +
+          `  Content: ${body.content?.substring(0, 100)}...\n` +
+          `  Message Type: ${body.message_type}\n` +
+          `  Content Attributes: ${JSON.stringify(body.content_attributes)}`,
+      );
+    }
+
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -1638,20 +1658,53 @@ export class ChatwootService {
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
         this.logger.verbose(`🗑️ Tentando deletar mensagem - Chatwoot ID: ${body.id}`);
 
-        const message = await this.prismaRepository.message.findFirst({
+        // 🔍 Tenta buscar pelo chatwootMessageId primeiro
+        let message = await this.prismaRepository.message.findFirst({
           where: {
             chatwootMessageId: body.id,
             instanceId: instance.instanceId,
           },
         });
 
+        // 🔍 Se não encontrou e tem source_id, tenta buscar por ele
+        if (!message && body.source_id) {
+          const whatsappId = body.source_id.replace('WAID:', '');
+          this.logger.verbose(`Tentando buscar por source_id: ${whatsappId}`);
+
+          message = await this.prismaRepository.message.findFirst({
+            where: {
+              instanceId: instance.instanceId,
+              key: {
+                path: ['id'],
+                equals: whatsappId,
+              },
+            },
+          });
+        }
+
         if (!message) {
-          this.logger.warn(`⚠️ Mensagem não encontrada no banco para deletar - Chatwoot ID: ${body.id}`);
+          this.logger.warn(
+            `⚠️ Mensagem não encontrada no banco para deletar:\n` +
+              `  Chatwoot ID: ${body.id}\n` +
+              `  Source ID: ${body.source_id}\n` +
+              `  Instance ID: ${instance.instanceId}\n` +
+              `  Content: ${body.content?.substring(0, 100)}`,
+          );
           return { message: 'bot' };
         }
 
         const key = message.key as WAMessageKey;
-        this.logger.verbose(`🗑️ Deletando mensagem - Key: ${JSON.stringify(key)}, Type: ${message.messageType}`);
+        const messageType = message.messageType;
+
+        this.logger.verbose(
+          `🗑️ Deletando mensagem:\n` +
+            `  Chatwoot ID: ${body.id}\n` +
+            `  Source ID: ${body.source_id}\n` +
+            `  WhatsApp ID: ${key.id}\n` +
+            `  Type: ${messageType}\n` +
+            `  RemoteJid: ${key.remoteJid}\n` +
+            `  FromMe: ${key.fromMe}`,
+        );
 
         try {
           // Delete for everyone (both mobile and WhatsApp Web)
@@ -1660,7 +1713,7 @@ export class ChatwootService {
             revoke: true,
           });
 
-          this.logger.log(`✅ Mensagem deletada no WhatsApp - ID: ${key.id}, Type: ${message.messageType}`);
+          this.logger.log(`✅ Mensagem deletada no WhatsApp - ID: ${key.id}, Type: ${messageType}`);
 
           await this.prismaRepository.message.deleteMany({
             where: {
@@ -1669,9 +1722,14 @@ export class ChatwootService {
             },
           });
         } catch (error) {
-          this.logger.error(`❌ Erro ao deletar mensagem no WhatsApp: ${error.message}`);
-          this.logger.error(`   Key: ${JSON.stringify(key)}`);
-          this.logger.error(`   Type: ${message.messageType}`);
+          this.logger.error(
+            `❌ Erro ao deletar mensagem no WhatsApp:\n` +
+              `  Error: ${error.message}\n` +
+              `  Key ID: ${key.id}\n` +
+              `  Type: ${messageType}\n` +
+              `  Chatwoot ID: ${body.id}\n` +
+              `  Source ID: ${body.source_id}`,
+          );
 
           // Mesmo com erro, remove do banco para não ficar inconsistente
           await this.prismaRepository.message.deleteMany({
@@ -1708,7 +1766,10 @@ export class ChatwootService {
         }
 
         if (command === 'clearcache') {
+          this.logger.log(`[/clearcache] Limpando cache da instância ${instance.instanceName}`);
           waInstance.clearCacheChatwoot();
+          this.logger.log(`[/clearcache] Cache limpo com sucesso para ${instance.instanceName}`);
+
           await this.createBotMessage(
             instance,
             i18next.t('cw.inbox.clearCache', {
@@ -1732,7 +1793,9 @@ export class ChatwootService {
               return message;
             };
 
+            this.logger.log(`[/lost command] Iniciando sincronização para ${instance.instanceName}`);
             const totalSynced = await this.syncLostMessages(instance, chatwootConfig, prepare);
+            this.logger.log(`[/lost command] Resultado: ${totalSynced} mensagens sincronizadas`);
 
             if (totalSynced > 0) {
               await this.createBotMessage(
@@ -1748,10 +1811,11 @@ export class ChatwootService {
               );
             }
           } catch (error) {
-            this.logger.error(`Erro ao sincronizar mensagens: ${error}`);
+            this.logger.error(`[/lost command] Erro ao sincronizar mensagens: ${error.message}`);
+            this.logger.error(`[/lost command] Stack: ${error.stack}`);
             await this.createBotMessage(
               instance,
-              '❌ Erro ao sincronizar mensagens. Tente novamente mais tarde.',
+              `❌ Erro ao sincronizar mensagens: ${error.message}\n\nTente novamente mais tarde ou contate o suporte.`,
               'incoming',
             );
           }
@@ -1864,9 +1928,27 @@ export class ChatwootService {
           await waInstance?.client?.logout('Log out instance: ' + instance.instanceName);
           await waInstance?.client?.ws?.close();
         }
+
+        // ✅ Comandos do bot sempre retornam sucesso (não devem ficar vermelhos)
+        return { message: 'bot' };
       }
 
       if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
+        // 🔍 Verifica se é retry (reenvio) - flag adicionada pelo Chatwoot no content_attributes raiz
+        const isRetry = body?.content_attributes?.retry_send === true;
+
+        if (isRetry) {
+          this.logger.verbose(`Mensagem ${body.id} tem flag retry_send=true, salvando no cache ANTES de enviar`);
+          // ⚠️ CRÍTICO: Salva no cache ANTES de enviar para WhatsApp (previne race condition)
+          const cacheKey = `chatwoot:retry:${instance.instanceName}:${body.id}`;
+          await this.cache.set(cacheKey, true, 300); // 5 minutos
+
+          // Aguarda um pouco para garantir que cache foi persistido (previne race condition)
+          await new Promise((resolve) => setTimeout(resolve, 50));
+
+          this.logger.verbose(`Cache salvo com sucesso: ${cacheKey}`);
+        }
+
         if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
           return { message: 'bot' };
         }
@@ -1902,7 +1984,7 @@ export class ChatwootService {
 
               let messageSent: any;
               try {
-                // 🔄 Retry automático para anexos (4 tentativas = ~19 segundos)
+                // 🔄 Retry automático para anexos (4 tentativas = ~25 segundos)
                 messageSent = await retryWithBackoff(
                   async () => {
                     const result = await this.sendAttachment(
@@ -1917,8 +1999,8 @@ export class ChatwootService {
                     }
                     return result;
                   },
-                  5,
-                  `Enviar anexo do Chatwoot para WhatsApp (${chatId})`,
+                  4,
+                  `Enviar anexo do SoConnect para WhatsApp (${chatId})`,
                 );
 
                 await this.updateChatwootMessageId(
@@ -1934,13 +2016,32 @@ export class ChatwootService {
                   instance,
                 );
               } catch (error) {
+                // ❌ TODOS os erros devem ficar vermelhos no Chatwoot
+                // Mensagem não foi enviada = usuário precisa saber
+
+                this.logger.error(
+                  `❌ Erro ao enviar anexo:\n` +
+                    `  ChatId: ${chatId}\n` +
+                    `  Attachment: ${attachment.data_url}\n` +
+                    `  Status: ${error?.status || 'unknown'}\n` +
+                    `  Message: ${error?.message || error}\n` +
+                    `  Full Error: ${JSON.stringify(error)}`,
+                );
+
                 if (!messageSent && body.conversation?.id) {
                   this.onSendMessageError(instance, body.conversation?.id, error);
                 }
-                throw error;
+
+                throw error; // Lança erro para Chatwoot mostrar vermelho
               }
             }
           } else {
+            // ✅ Validação: Não envia texto vazio (previne erro 400)
+            if (!formatText || formatText.trim() === '') {
+              this.logger.warn(`[VALIDAÇÃO] Texto vazio detectado - Ignorando envio (chatId: ${chatId})`);
+              return { message: 'bot' };
+            }
+
             const data: SendTextDto = {
               number: chatId,
               text: formatText,
@@ -1952,7 +2053,7 @@ export class ChatwootService {
 
             let messageSent: any;
             try {
-              // 🔄 Retry automático: 4 tentativas (~19 segundos total)
+              // 🔄 Retry automático: 4 tentativas (~25 segundos total)
               messageSent = await retryWithBackoff(
                 async () => {
                   const result = await waInstance?.textMessage(data, true);
@@ -1961,8 +2062,8 @@ export class ChatwootService {
                   }
                   return result;
                 },
-                5,
-                `Enviar mensagem do Chatwoot para WhatsApp (${chatId})`,
+                4,
+                `Enviar mensagem do SoConnect para WhatsApp (${chatId})`,
               );
 
               if (Long.isLong(messageSent?.messageTimestamp)) {
@@ -1982,10 +2083,23 @@ export class ChatwootService {
                 instance,
               );
             } catch (error) {
+              // ❌ TODOS os erros devem ficar vermelhos no Chatwoot
+              // Mensagem não foi enviada = usuário precisa saber
+
+              this.logger.error(
+                `❌ Erro ao enviar mensagem:\n` +
+                  `  ChatId: ${chatId}\n` +
+                  `  Text: ${formatText}\n` +
+                  `  Status: ${error?.status || 'unknown'}\n` +
+                  `  Message: ${error?.message || error}\n` +
+                  `  Full Error: ${JSON.stringify(error)}`,
+              );
+
               if (!messageSent && body.conversation?.id) {
                 this.onSendMessageError(instance, body.conversation?.id, error);
               }
-              throw error;
+
+              throw error; // Lança erro para Chatwoot mostrar vermelho
             }
           }
         }
@@ -2610,6 +2724,35 @@ export class ChatwootService {
         }
 
         const messageType = body.key.fromMe ? 'outgoing' : 'incoming';
+
+        // 🔍 Verifica se é mensagem de retry para não enviar webhook de volta
+        if (body.key.fromMe && messageType === 'outgoing') {
+          // Busca a mensagem no banco para pegar o chatwootMessageId
+          const existingMessage = await this.prismaRepository.message.findFirst({
+            where: {
+              instanceId: instance.instanceId,
+              key: {
+                path: ['id'],
+                equals: body.key.id,
+              },
+            },
+          });
+
+          if (existingMessage?.chatwootMessageId) {
+            // Verifica se tem flag de retry no cache
+            const cacheKey = `chatwoot:retry:${instance.instanceName}:${existingMessage.chatwootMessageId}`;
+            const isRetry = await this.cache.get(cacheKey);
+
+            if (isRetry) {
+              this.logger.verbose(
+                `Mensagem ${body.key.id} é retry (chatwootMessageId: ${existingMessage.chatwootMessageId}), não enviando webhook (evita duplicação)`,
+              );
+              // Remove do cache
+              await this.cache.delete(cacheKey);
+              return;
+            }
+          }
+        }
 
         if (isMedia) {
           const downloadBase64 = await waInstance?.getBase64FromMediaMessage({
@@ -3361,14 +3504,32 @@ export class ChatwootService {
     prepareMessage: (message: any) => any,
   ) {
     try {
+      this.logger.log(`[syncLostMessages] Iniciando sincronização para ${instance.instanceName}`);
+
       if (!this.isImportHistoryAvailable()) {
-        return;
+        this.logger.warn('[syncLostMessages] Import history not available');
+        return 0;
       }
       if (!this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
-        return;
+        this.logger.warn('[syncLostMessages] MESSAGE_UPDATE not enabled');
+        return 0;
+      }
+
+      // 🔧 Valida provider antes de continuar
+      const provider = await this.clientCw(instance);
+      if (!provider) {
+        this.logger.error(`[syncLostMessages] Provider not found for ${instance.instanceName}`);
+        throw new Error('Configuração do SoConnect não encontrada. Verifique a integração.');
       }
 
       const inbox = await this.getInbox(instance);
+      if (!inbox) {
+        this.logger.error(`[syncLostMessages] Inbox not found for ${instance.instanceName}`);
+        throw new Error('Caixa de entrada não encontrada no SoConnect. Verifique a configuração.');
+      }
+
+      this.logger.log(`[syncLostMessages] Provider e Inbox validados com sucesso`);
+      this.logger.log(`[syncLostMessages] AccountId: ${chatwootConfig.accountId}, InboxId: ${inbox.id}`);
 
       const sqlMessages = `select * from messages m
       where account_id = ${chatwootConfig.accountId}
@@ -3392,6 +3553,10 @@ export class ChatwootService {
       const filteredMessages = savedMessages.filter(
         (msg: any) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid),
       );
+
+      this.logger.log(`[syncLostMessages] Mensagens encontradas no banco: ${savedMessages.length}`);
+      this.logger.log(`[syncLostMessages] Mensagens após filtro: ${filteredMessages.length}`);
+
       const messagesRaw: any[] = [];
       for (const m of filteredMessages) {
         if (!m.message || !m.key || !m.messageTimestamp) {
@@ -3410,6 +3575,14 @@ export class ChatwootService {
         messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
       );
 
+      this.logger.log(`[syncLostMessages] Mensagens preparadas para importação: ${messagesRaw.length}`);
+
+      // 🔧 Se não há mensagens para importar, retorna 0 sem chamar importHistoryMessages
+      if (messagesRaw.length === 0) {
+        this.logger.log(`[syncLostMessages] Nenhuma mensagem para importar`);
+        return 0;
+      }
+
       const totalImported = await chatwootImport.importHistoryMessages(
         instance,
         this,
@@ -3421,9 +3594,19 @@ export class ChatwootService {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance.clearCacheChatwoot();
 
+      this.logger.log(`[syncLostMessages] Sincronização concluída: ${totalImported} mensagens importadas`);
+
+      // 🔧 Se retornou 0, pode ser erro silencioso ou realmente não tinha mensagens
+      if (totalImported === 0 && messagesRaw.length > 0) {
+        this.logger.warn(
+          `[syncLostMessages] ⚠️ ATENÇÃO: ${messagesRaw.length} mensagens foram encontradas mas 0 foram importadas. Pode haver erro na importação.`,
+        );
+      }
+
       return totalImported || 0;
-    } catch {
-      return 0;
+    } catch (error) {
+      this.logger.error(`[syncLostMessages] Erro: ${error.message}`);
+      throw error; // Lança erro para o comando /lost tratar
     }
   }
 }
