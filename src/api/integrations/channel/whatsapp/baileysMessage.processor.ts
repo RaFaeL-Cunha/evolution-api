@@ -57,11 +57,20 @@ export class BaileysMessageProcessor {
     if (!msg.key?.id || !msg.key?.remoteJid) return;
 
     const messageKey = `${msg.key.remoteJid}_${msg.key.id}_${msg.key.participant || ''}`;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const contactKey = msg.key.participant || msg.key.remoteJid;
+
     this.sessionErrorCache.set(messageKey, Date.now());
 
     this.processorLogs.warn(
       `Mensagem marcada como problemática devido a erro de sessão: ${messageKey} ` +
         `(de: ${msg.key.participant || msg.key.remoteJid})`,
+    );
+
+    // Log adicional para diagnóstico de PreKey errors
+    this.processorLogs.warn(
+      `Detalhes do erro: remoteJid=${msg.key.remoteJid}, participant=${msg.key.participant || 'N/A'}, ` +
+        `messageId=${msg.key.id}, fromMe=${msg.key.fromMe || false}`,
     );
   }
 

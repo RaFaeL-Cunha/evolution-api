@@ -229,6 +229,8 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
 
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
+  private preKeyErrorTracker = new Map<string, { count: number; lastError: number }>(); // Track PreKey errors by contact
+  private failedMessages = new Map<string, Array<{ message: any; timestamp: number; attempts: number }>>(); // Store failed messages by contact
 
   constructor(
     public readonly configService: ConfigService,
@@ -1646,6 +1648,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // Remove campos que não existem no schema do Prisma antes de salvar
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { isForwarded, forwardingScore, ...messageToSave } = messageRaw as any;
 
             const msg = await this.prismaRepository.message.create({
@@ -2288,8 +2291,26 @@ export class BaileysStartupService extends ChannelStartupService {
                 ) {
                   this.logger.warn(
                     `Mensagem filtrada devido a erro de descriptografia: ${msg.key?.id} ` +
-                      `(de: ${msg.key?.participant || msg.key?.remoteJid})`,
+                      `(de: ${msg.key?.participant || msg.key?.remoteJid}, grupo: ${msg.key?.remoteJid?.includes('@g.us') ? msg.key?.remoteJid : 'N/A'})`,
                   );
+
+                  // Log adicional para PreKey errors específicos
+                  const preKeyError = msg?.messageStubParameters?.find?.((param) =>
+                    param?.includes?.('Invalid PreKey ID'),
+                  );
+                  if (preKeyError) {
+                    this.logger.error(
+                      `PreKeyError detectado - Contato: ${msg.key?.participant || msg.key?.remoteJid} ` +
+                        `pode precisar reestabelecer sessão de criptografia`,
+                    );
+                  }
+
+                  // Armazena mensagem para tentar reprocessar depois
+                  const contactJid = msg.key?.participant || msg.key?.remoteJid;
+                  if (contactJid) {
+                    this.storeFailedMessage(msg, contactJid);
+                  }
+
                   return false;
                 }
                 return true;
@@ -2790,7 +2811,7 @@ export class BaileysStartupService extends ChannelStartupService {
       let mentions: string[];
       let contextInfo: any;
 
-      if (isJidGroup(sender)) {
+      if (isJidGroup(sender) && !sender.endsWith('@lid')) {
         let group;
         try {
           const cache = this.configService.get<CacheConf>('CACHE');
@@ -3084,6 +3105,44 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (!text || text.trim().length === 0) {
       throw new BadRequestException('Text is required');
+    }
+
+    // 🔍 DETECÇÃO DE RETRY: Verifica se mensagem similar foi enviada recentemente
+    if (isIntegration) {
+      const remoteJid = createJid(data.number, 's.whatsapp.net');
+      const recentMessage = await this.prismaRepository.message.findFirst({
+        where: {
+          instanceId: this.instanceId,
+          key: {
+            path: ['remoteJid'],
+            equals: remoteJid,
+          },
+          message: {
+            path: ['conversation'],
+            string_contains: text.substring(0, 50), // Primeiros 50 chars
+          },
+          messageTimestamp: {
+            gte: Math.floor(Date.now() / 1000) - 300, // Últimos 5 minutos
+          },
+        },
+        orderBy: {
+          messageTimestamp: 'desc',
+        },
+      });
+
+      if (recentMessage?.chatwootMessageId) {
+        this.logger.warn(
+          `⚠️ [CHATWOOT RETRY] Mensagem similar detectada nos últimos 5min\n` +
+            `  - Número: ${data.number}\n` +
+            `  - Texto: ${text.substring(0, 30)}...\n` +
+            `  - Chatwoot ID anterior: ${recentMessage.chatwootMessageId}\n` +
+            `  - WhatsApp ID anterior: ${recentMessage.key['id']}\n` +
+            `  → Salvando flag no cache para bloquear webhook`,
+        );
+
+        const cacheKey = `chatwoot:retry:${this.instance.name}:${recentMessage.chatwootMessageId}`;
+        await this.cache.set(cacheKey, true, 300);
+      }
     }
 
     return await this.sendMessageWithTyping(
@@ -3453,6 +3512,43 @@ export class BaileysStartupService extends ChannelStartupService {
     const mediaData: SendMediaDto = { ...data };
 
     if (file) mediaData.media = file.buffer.toString('base64');
+
+    // 🔍 DETECÇÃO DE RETRY: Verifica se mídia similar foi enviada recentemente
+    if (isIntegration && data.caption) {
+      const remoteJid = createJid(data.number, 's.whatsapp.net');
+      const recentMessage = await this.prismaRepository.message.findFirst({
+        where: {
+          instanceId: this.instanceId,
+          key: {
+            path: ['remoteJid'],
+            equals: remoteJid,
+          },
+          message: {
+            path: ['caption'],
+            string_contains: data.caption.substring(0, 50),
+          },
+          messageTimestamp: {
+            gte: Math.floor(Date.now() / 1000) - 300,
+          },
+        },
+        orderBy: {
+          messageTimestamp: 'desc',
+        },
+      });
+
+      if (recentMessage?.chatwootMessageId) {
+        this.logger.warn(
+          `⚠️ [CHATWOOT RETRY] Mídia similar detectada nos últimos 5min\n` +
+            `  - Número: ${data.number}\n` +
+            `  - Caption: ${data.caption?.substring(0, 30)}...\n` +
+            `  - Chatwoot ID anterior: ${recentMessage.chatwootMessageId}\n` +
+            `  → Salvando flag no cache`,
+        );
+
+        const cacheKey = `chatwoot:retry:${this.instance.name}:${recentMessage.chatwootMessageId}`;
+        await this.cache.set(cacheKey, true, 300);
+      }
+    }
 
     const generate = await this.prepareMediaMessage(mediaData);
 
@@ -4839,8 +4935,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Group
-  private async updateGroupMetadataCache(groupJid: string) {
+  public async updateGroupMetadataCache(groupJid: string) {
     try {
+      if (groupJid.endsWith('@lid')) {
+        this.logger.warn(`Skipping groupMetadata for LID JID: ${groupJid}`);
+        return null;
+      }
       const meta = await this.client.groupMetadata(groupJid);
 
       const cacheConf = this.configService.get<CacheConf>('CACHE');
@@ -4855,13 +4955,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return meta;
     } catch (error) {
-      this.logger.error(error);
+      if (error instanceof TypeError && error.message.includes("'attrs'")) {
+        this.logger.warn(`Metadados do grupo não encontrados para ${groupJid} (erro de atributos do Baileys)`);
+      } else {
+        this.logger.error(`Erro ao atualizar cache de metadados do grupo ${groupJid}: ${error.message}`);
+      }
       return null;
     }
   }
 
-  private getGroupMetadataCache = async (groupJid: string) => {
-    if (!isJidGroup(groupJid)) return null;
+  public getGroupMetadataCache = async (groupJid: string) => {
+    if (!isJidGroup(groupJid) || groupJid.endsWith('@lid')) return null;
 
     const cacheConf = this.configService.get<CacheConf>('CACHE');
 
@@ -5002,6 +5106,10 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       if (reply === 'inner') {
         return;
+      }
+      if (error instanceof TypeError && error.message.includes("'attrs'")) {
+        this.logger.warn(`Grupo ${id.groupJid} não encontrado ou erro de atributos`);
+        throw new NotFoundException('Group not found');
       }
       throw new NotFoundException('Error fetching group', error.toString());
     }
@@ -5275,7 +5383,13 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       const chatwootConfig = await this.findChatwoot();
       const prepare = (message: any) => this.prepareMessage(message);
-      this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+
+      // 🔧 Primeira execução com tratamento de erro
+      try {
+        await this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+      } catch (error) {
+        this.logger.error(`[syncChatwootLostMessages] Erro na primeira execução: ${error.message}`);
+      }
 
       // Generate ID for this cron task and store in cache
       const cronId = cuid();
@@ -5293,7 +5407,14 @@ export class BaileysStartupService extends ChannelStartupService {
             return;
           }
         }
-        this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+
+        // 🔧 Execução do cron com tratamento de erro
+        try {
+          await this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+        } catch (error) {
+          this.logger.error(`[syncChatwootLostMessages] Erro no cron: ${error.message}`);
+          // Não para o cron, apenas loga o erro e continua na próxima execução
+        }
       });
       task.start();
     }
@@ -5476,6 +5597,195 @@ export class BaileysStartupService extends ChannelStartupService {
     return response;
   }
 
+  /**
+   * Armazena mensagem que falhou na descriptografia para tentar reprocessar depois
+   */
+  private storeFailedMessage(msg: any, contactJid: string) {
+    try {
+      const MAX_STORED_MESSAGES = 50; // Limite por contato
+      const MAX_AGE_MS = 30 * 60 * 1000; // 30 minutos
+
+      if (!this.failedMessages.has(contactJid)) {
+        this.failedMessages.set(contactJid, []);
+      }
+
+      const messages = this.failedMessages.get(contactJid);
+
+      // Limpa mensagens antigas
+      const now = Date.now();
+      const validMessages = messages.filter((m) => now - m.timestamp < MAX_AGE_MS);
+
+      // Verifica se a mensagem já está armazenada (evita duplicação)
+      const messageId = msg.key?.id;
+      const alreadyStored = validMessages.some((m) => m.message.key?.id === messageId);
+
+      if (alreadyStored) {
+        this.logger.verbose(`Mensagem ${messageId} já está armazenada, ignorando duplicação`);
+        return;
+      }
+
+      // Adiciona nova mensagem se não atingiu o limite
+      if (validMessages.length < MAX_STORED_MESSAGES) {
+        validMessages.push({
+          message: msg,
+          timestamp: now,
+          attempts: 0,
+        });
+
+        this.logger.warn(
+          `Mensagem armazenada para reprocessamento futuro. ` +
+            `Contato: ${contactJid}, Total armazenado: ${validMessages.length}`,
+        );
+      } else {
+        this.logger.error(
+          `Limite de mensagens armazenadas atingido para ${contactJid}. ` + `Mensagem será descartada permanentemente.`,
+        );
+      }
+
+      this.failedMessages.set(contactJid, validMessages);
+    } catch (error) {
+      this.logger.error(`Erro ao armazenar mensagem falha: ${error?.message || String(error)}`);
+    }
+  }
+
+  /**
+   * Tenta reprocessar mensagens que falharam anteriormente
+   */
+  private async retryFailedMessages(contactJid: string): Promise<number> {
+    try {
+      const messages = this.failedMessages.get(contactJid);
+
+      if (!messages || messages.length === 0) {
+        return 0;
+      }
+
+      this.logger.info(`Tentando reprocessar ${messages.length} mensagem(ns) armazenada(s) de ${contactJid}`);
+
+      let successCount = 0;
+      const remainingMessages = [];
+
+      for (const item of messages) {
+        item.attempts++;
+
+        // Máximo 3 tentativas por mensagem
+        if (item.attempts > 3) {
+          this.logger.error(`Mensagem descartada após 3 tentativas. ID: ${item.message?.key?.id}`);
+          continue;
+        }
+
+        try {
+          // Tenta reprocessar a mensagem
+          const settings = await this.findSettings();
+          await this.messageHandle['messages.upsert']({ messages: [item.message], type: 'notify' }, settings);
+
+          // Adiciona ao cache para evitar reprocessamento duplicado
+          const messageKey = `${this.instance.id}_${item.message.key.id}`;
+          await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+
+          successCount++;
+          this.logger.info(`Mensagem reprocessada com sucesso! ID: ${item.message?.key?.id}`);
+        } catch (error) {
+          const errorMsg = error?.message || String(error);
+
+          // Se ainda tem erro de sessão, mantém para próxima tentativa
+          if (errorMsg.includes('SessionError') || errorMsg.includes('PreKey')) {
+            remainingMessages.push(item);
+            this.logger.warn(
+              `Mensagem ainda não pode ser processada (tentativa ${item.attempts}/3). ` +
+                `ID: ${item.message?.key?.id}`,
+            );
+          } else {
+            this.logger.error(`Erro ao reprocessar mensagem: ${errorMsg.substring(0, 200)}`);
+          }
+        }
+      }
+
+      // Atualiza lista com mensagens que ainda precisam ser reprocessadas
+      if (remainingMessages.length > 0) {
+        this.failedMessages.set(contactJid, remainingMessages);
+      } else {
+        this.failedMessages.delete(contactJid);
+      }
+
+      if (successCount > 0) {
+        this.logger.info(`${successCount} mensagem(ns) recuperada(s) com sucesso de ${contactJid}!`);
+      }
+
+      return successCount;
+    } catch (error) {
+      this.logger.error(`Erro ao reprocessar mensagens: ${error?.message || String(error)}`);
+      return 0;
+    }
+  }
+
+  /**
+   * Tenta recuperar sessão de criptografia com contato problemático
+   * @param jid - JID do contato com erro de PreKey
+   */
+  private async attemptSessionRecovery(jid: string): Promise<boolean> {
+    try {
+      const now = Date.now();
+      const errorInfo = this.preKeyErrorTracker.get(jid);
+
+      // Registra o erro
+      if (!errorInfo) {
+        this.preKeyErrorTracker.set(jid, { count: 1, lastError: now });
+        return false;
+      }
+
+      errorInfo.count++;
+      errorInfo.lastError = now;
+
+      // Após 2 erros, tenta reestabelecer a sessão
+      if (errorInfo.count >= 2) {
+        this.logger.warn(`Detectados ${errorInfo.count} erros de PreKey para ${jid}. Tentando reestabelecer sessão...`);
+
+        try {
+          // Força reestabelecimento da sessão
+          await this.client.assertSessions([jid], true);
+
+          this.logger.info(`Sessão reestabelecida com sucesso para ${jid}`);
+
+          // Tenta reprocessar mensagens armazenadas
+          const recoveredCount = await this.retryFailedMessages(jid);
+          if (recoveredCount > 0) {
+            this.logger.info(`${recoveredCount} mensagem(ns) perdida(s) foi(ram) recuperada(s)!`);
+          }
+
+          // Reseta o contador após sucesso
+          this.preKeyErrorTracker.delete(jid);
+          return true;
+        } catch (assertError) {
+          this.logger.error(`Falha ao reestabelecer sessão com ${jid}: ${assertError?.message || String(assertError)}`);
+
+          // Se falhar 3 vezes, descarta mensagens e reseta contador
+          if (errorInfo.count >= 3) {
+            // Notifica sobre mensagens perdidas
+            const lostMessages = this.failedMessages.get(jid);
+            if (lostMessages && lostMessages.length > 0) {
+              this.logger.error(
+                `ATENÇÃO: ${lostMessages.length} mensagem(ns) de ${jid} não puderam ser recuperadas após 3 tentativas e serão descartadas.`,
+              );
+              this.failedMessages.delete(jid);
+            }
+
+            // ZERA o contador para permitir novas mensagens
+            this.preKeyErrorTracker.delete(jid);
+
+            this.logger.warn(
+              `Contador resetado para ${jid}. Novas mensagens deste contato poderão acionar o processo de recuperação novamente.`,
+            );
+          }
+        }
+      }
+
+      return false;
+    } catch (error) {
+      this.logger.error(`Erro ao tentar recuperar sessão: ${error?.message || String(error)}`);
+      return false;
+    }
+  }
+
   public async baileysSignalRepositoryDecryptMessage(jid: string, type: 'pkmsg' | 'msg', ciphertext: string) {
     try {
       const ciphertextBuffer = Buffer.from(ciphertext, 'base64');
@@ -5486,10 +5796,26 @@ export class BaileysStartupService extends ChannelStartupService {
         ciphertext: ciphertextBuffer,
       });
 
+      // Limpa o rastreador de erros em caso de sucesso
+      if (this.preKeyErrorTracker.has(jid)) {
+        this.preKeyErrorTracker.delete(jid);
+      }
+
       return response instanceof Uint8Array ? Buffer.from(response).toString('base64') : response;
     } catch (error) {
-      this.logger.error('Error decrypting message:');
-      this.logger.error(error);
+      const errorMsg = error?.message || String(error);
+
+      // Log detalhado para erros de PreKey
+      if (errorMsg.includes('PreKey') || errorMsg.includes('SessionError')) {
+        this.logger.error(`Erro de descriptografia (${type}) para ${jid}: ${errorMsg.substring(0, 200)}`);
+
+        // Tenta recuperar a sessão automaticamente
+        await this.attemptSessionRecovery(jid);
+      } else {
+        this.logger.error('Error decrypting message:');
+        this.logger.error(error);
+      }
+
       throw error;
     }
   }

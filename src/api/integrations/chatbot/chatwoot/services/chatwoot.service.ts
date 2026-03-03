@@ -1934,21 +1934,6 @@ export class ChatwootService {
       }
 
       if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
-        // 🔍 Verifica se é retry (reenvio) - flag adicionada pelo Chatwoot no content_attributes raiz
-        const isRetry = body?.content_attributes?.retry_send === true;
-
-        if (isRetry) {
-          this.logger.verbose(`Mensagem ${body.id} tem flag retry_send=true, salvando no cache ANTES de enviar`);
-          // ⚠️ CRÍTICO: Salva no cache ANTES de enviar para WhatsApp (previne race condition)
-          const cacheKey = `chatwoot:retry:${instance.instanceName}:${body.id}`;
-          await this.cache.set(cacheKey, true, 300); // 5 minutos
-
-          // Aguarda um pouco para garantir que cache foi persistido (previne race condition)
-          await new Promise((resolve) => setTimeout(resolve, 50));
-
-          this.logger.verbose(`Cache salvo com sucesso: ${cacheKey}`);
-        }
-
         if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
           return { message: 'bot' };
         }
@@ -1956,6 +1941,34 @@ export class ChatwootService {
         if (!waInstance && body.conversation?.id) {
           this.onSendMessageError(instance, body.conversation?.id, 'Instance not found');
           return { message: 'bot' };
+        }
+
+        // 🔍 DETECÇÃO DE RETRY (2 métodos):
+        // 1. Flag retry_send do Chatwoot
+        const hasRetryFlag = body?.content_attributes?.retry_send === true;
+
+        // 2. Mensagem já existe no banco
+        const existingMessageCheck = await this.prismaRepository.message.findFirst({
+          where: {
+            instanceId: instance.instanceId,
+            chatwootMessageId: body.id,
+          },
+        });
+
+        const isRetry = hasRetryFlag || !!existingMessageCheck;
+
+        if (isRetry) {
+          this.logger.warn(
+            `⚠️ [WHATSAPP RETRY] Detectado retry para Chatwoot msg ${body.id}\n` +
+              `  - Flag retry_send: ${hasRetryFlag}\n` +
+              `  - Já existe no banco: ${!!existingMessageCheck}\n` +
+              `  - WhatsApp ID anterior: ${existingMessageCheck?.key['id'] || 'N/A'}\n` +
+              `  → Salvando flag no cache para bloquear webhook de retorno`,
+          );
+
+          const cacheKey = `chatwoot:retry:${instance.instanceName}:${body.id}`;
+          await this.cache.set(cacheKey, true, 300);
+          await new Promise((resolve) => setTimeout(resolve, 50));
         }
 
         let formatText: string;
@@ -2739,15 +2752,16 @@ export class ChatwootService {
           });
 
           if (existingMessage?.chatwootMessageId) {
-            // Verifica se tem flag de retry no cache
             const cacheKey = `chatwoot:retry:${instance.instanceName}:${existingMessage.chatwootMessageId}`;
             const isRetry = await this.cache.get(cacheKey);
 
             if (isRetry) {
-              this.logger.verbose(
-                `Mensagem ${body.key.id} é retry (chatwootMessageId: ${existingMessage.chatwootMessageId}), não enviando webhook (evita duplicação)`,
+              this.logger.warn(
+                `🚫 [WHATSAPP RETRY] Bloqueando webhook de retorno\n` +
+                  `  - WhatsApp ID: ${body.key.id}\n` +
+                  `  - Chatwoot ID: ${existingMessage.chatwootMessageId}\n` +
+                  `  → Webhook NÃO será enviado (evita duplicação)`,
               );
-              // Remove do cache
               await this.cache.delete(cacheKey);
               return;
             }
