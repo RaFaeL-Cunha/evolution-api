@@ -1972,10 +1972,14 @@ export class BaileysStartupService extends ChannelStartupService {
           if (update.message === null && update.status === undefined) {
             this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+              // Remove campo 'message' que não existe no schema do Prisma
+              // eslint-disable-next-line @typescript-eslint/no-unused-vars
+              const { message: _, ...messageUpdateData } = message;
               await this.prismaRepository.messageUpdate.create({
-                data: message,
+                data: messageUpdateData,
               });
+            }
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               this.chatwootService.eventWhatsapp(
@@ -2023,8 +2027,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-            await this.prismaRepository.messageUpdate.create({ data: message });
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+            // Remove campo 'message' que não existe no schema do Prisma
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { message: _, ...messageUpdateData } = message;
+            await this.prismaRepository.messageUpdate.create({ data: messageUpdateData });
+          }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: {
@@ -3109,7 +3117,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // 🔍 DETECÇÃO DE RETRY: Verifica se mensagem similar foi enviada recentemente
     if (isIntegration) {
-      const remoteJid = createJid(data.number, 's.whatsapp.net');
+      const remoteJid = createJid(data.number);
       const recentMessage = await this.prismaRepository.message.findFirst({
         where: {
           instanceId: this.instanceId,
@@ -3515,7 +3523,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // 🔍 DETECÇÃO DE RETRY: Verifica se mídia similar foi enviada recentemente
     if (isIntegration && data.caption) {
-      const remoteJid = createJid(data.number, 's.whatsapp.net');
+      const remoteJid = createJid(data.number);
       const recentMessage = await this.prismaRepository.message.findFirst({
         where: {
           instanceId: this.instanceId,

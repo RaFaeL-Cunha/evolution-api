@@ -2045,7 +2045,20 @@ export class ChatwootService {
                   this.onSendMessageError(instance, body.conversation?.id, error);
                 }
 
-                throw error; // Lança erro para Chatwoot mostrar vermelho
+                // Identifica tipo de erro e mostra mensagem apropriada
+                let errorMsg = 'Erro ao enviar anexo';
+                if (error?.message?.includes('timeout')) {
+                  errorMsg = 'Tempo esgotado. Verifique sua conexão';
+                } else if (error?.message?.includes('not connected')) {
+                  errorMsg = 'WhatsApp desconectado';
+                } else if (error?.message?.includes('Invalid')) {
+                  errorMsg = 'Arquivo ou formato inválido';
+                } else if (error?.message?.includes('too large')) {
+                  errorMsg = 'Arquivo muito grande';
+                }
+
+                const cleanError = new Error(`Falha ao enviar após 4 tentativas. ${errorMsg}`);
+                throw cleanError;
               }
             }
           } else {
@@ -2112,7 +2125,11 @@ export class ChatwootService {
                 this.onSendMessageError(instance, body.conversation?.id, error);
               }
 
-              throw error; // Lança erro para Chatwoot mostrar vermelho
+              // Lança erro limpo para Chatwoot (sem stack trace)
+              const cleanError = new Error(
+                `Falha ao enviar mensagem após 4 tentativas. ${error?.message?.split('\n')[0] || 'Erro desconhecido'}`,
+              );
+              throw cleanError;
             }
           }
         }
