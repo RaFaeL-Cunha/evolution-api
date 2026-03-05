@@ -3356,7 +3356,10 @@ export class ChatwootService {
       if (event === Events.CONTACTS_UPDATE) {
         this.logger.verbose(`📸 Evento CONTACTS_UPDATE recebido para ${instance.instanceName}`);
 
-        for (const contactData of body) {
+        // body pode ser um objeto único ou array
+        const contacts = Array.isArray(body) ? body : [body];
+
+        for (const contactData of contacts) {
           try {
             const remoteJid = contactData.remoteJid;
             const profilePicUrl = contactData.profilePicUrl;
