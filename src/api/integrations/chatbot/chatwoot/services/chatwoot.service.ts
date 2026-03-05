@@ -69,7 +69,20 @@ async function retryWithBackoff<T>(
 
       return result;
     } catch (error) {
-      const errorMsg = error?.message || String(error);
+      // Extrai mensagem de erro útil
+      let errorMsg = 'Erro desconhecido';
+      if (error?.message) {
+        errorMsg = error.message;
+      } else if (typeof error === 'object') {
+        if (error?.exists === false) {
+          errorMsg = 'Número não está no WhatsApp';
+        } else {
+          errorMsg = JSON.stringify(error);
+        }
+      } else {
+        errorMsg = String(error);
+      }
+
       const errorStatus = error?.status || error?.response?.status || 'unknown';
 
       if (attempt === maxAttempts) {
@@ -1038,22 +1051,6 @@ export class ChatwootService {
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
-          if (!body.key.fromMe) {
-            const waProfilePictureFile =
-              picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
-            const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
-            const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
-            const nameNeedsUpdate = !contact.name || contact.name === chatId;
-            this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
-            this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
-            if (pictureNeedsUpdate || nameNeedsUpdate) {
-              contact = await this.updateContact(instance, contact.id, {
-                ...(nameNeedsUpdate && { name: nameContact }),
-                ...(waProfilePictureFile === '' && { avatar: null }),
-                ...(pictureNeedsUpdate && { avatar_url: picture_url?.profilePictureUrl }),
-              });
-            }
-          }
         } else {
           contact = await this.createContact(
             instance,
@@ -1943,34 +1940,6 @@ export class ChatwootService {
           return { message: 'bot' };
         }
 
-        // 🔍 DETECÇÃO DE RETRY (2 métodos):
-        // 1. Flag retry_send do Chatwoot
-        const hasRetryFlag = body?.content_attributes?.retry_send === true;
-
-        // 2. Mensagem já existe no banco
-        const existingMessageCheck = await this.prismaRepository.message.findFirst({
-          where: {
-            instanceId: instance.instanceId,
-            chatwootMessageId: body.id,
-          },
-        });
-
-        const isRetry = hasRetryFlag || !!existingMessageCheck;
-
-        if (isRetry) {
-          this.logger.warn(
-            `⚠️ [WHATSAPP RETRY] Detectado retry para Chatwoot msg ${body.id}\n` +
-              `  - Flag retry_send: ${hasRetryFlag}\n` +
-              `  - Já existe no banco: ${!!existingMessageCheck}\n` +
-              `  - WhatsApp ID anterior: ${existingMessageCheck?.key['id'] || 'N/A'}\n` +
-              `  → Salvando flag no cache para bloquear webhook de retorno`,
-          );
-
-          const cacheKey = `chatwoot:retry:${instance.instanceName}:${body.id}`;
-          await this.cache.set(cacheKey, true, 300);
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-
         let formatText: string;
         if (senderName === null || senderName === undefined) {
           formatText = messageReceived;
@@ -2112,12 +2081,30 @@ export class ChatwootService {
               // ❌ TODOS os erros devem ficar vermelhos no Chatwoot
               // Mensagem não foi enviada = usuário precisa saber
 
+              // Extrai informação útil do erro
+              let errorDetails = 'Erro desconhecido';
+              let userFriendlyMessage = 'Não foi possível enviar a mensagem. Verifique sua conexão.';
+
+              if (error?.message) {
+                errorDetails = error.message;
+              } else if (typeof error === 'object') {
+                // Se o erro for um objeto (ex: BadRequestException com dados do número)
+                if (error?.exists === false) {
+                  errorDetails = `Número ${chatId} não está no WhatsApp`;
+                  userFriendlyMessage = `❌ O número ${chatId} não existe no WhatsApp. Verifique o número e tente novamente.`;
+                } else {
+                  errorDetails = JSON.stringify(error);
+                }
+              } else {
+                errorDetails = String(error);
+              }
+
               this.logger.error(
                 `❌ Erro ao enviar mensagem:\n` +
                   `  ChatId: ${chatId}\n` +
                   `  Text: ${formatText}\n` +
                   `  Status: ${error?.status || 'unknown'}\n` +
-                  `  Message: ${error?.message || error}\n` +
+                  `  Message: ${errorDetails}\n` +
                   `  Full Error: ${JSON.stringify(error)}`,
               );
 
@@ -2125,9 +2112,11 @@ export class ChatwootService {
                 this.onSendMessageError(instance, body.conversation?.id, error);
               }
 
-              // Lança erro limpo para Chatwoot (sem stack trace)
+              // Lança erro limpo e amigável para Chatwoot
               const cleanError = new Error(
-                `Falha ao enviar mensagem após 4 tentativas. ${error?.message?.split('\n')[0] || 'Erro desconhecido'}`,
+                error?.exists === false
+                  ? userFriendlyMessage
+                  : `Falha ao enviar mensagem após 4 tentativas. ${errorDetails.split('\n')[0]}`,
               );
               throw cleanError;
             }
@@ -2755,36 +2744,6 @@ export class ChatwootService {
 
         const messageType = body.key.fromMe ? 'outgoing' : 'incoming';
 
-        // 🔍 Verifica se é mensagem de retry para não enviar webhook de volta
-        if (body.key.fromMe && messageType === 'outgoing') {
-          // Busca a mensagem no banco para pegar o chatwootMessageId
-          const existingMessage = await this.prismaRepository.message.findFirst({
-            where: {
-              instanceId: instance.instanceId,
-              key: {
-                path: ['id'],
-                equals: body.key.id,
-              },
-            },
-          });
-
-          if (existingMessage?.chatwootMessageId) {
-            const cacheKey = `chatwoot:retry:${instance.instanceName}:${existingMessage.chatwootMessageId}`;
-            const isRetry = await this.cache.get(cacheKey);
-
-            if (isRetry) {
-              this.logger.warn(
-                `🚫 [WHATSAPP RETRY] Bloqueando webhook de retorno\n` +
-                  `  - WhatsApp ID: ${body.key.id}\n` +
-                  `  - Chatwoot ID: ${existingMessage.chatwootMessageId}\n` +
-                  `  → Webhook NÃO será enviado (evita duplicação)`,
-              );
-              await this.cache.delete(cacheKey);
-              return;
-            }
-          }
-        }
-
         if (isMedia) {
           const downloadBase64 = await waInstance?.getBase64FromMediaMessage({
             message: {
@@ -3391,6 +3350,40 @@ export class ChatwootService {
 
           await this.createBotMessage(instance, msgQrCode, 'incoming');
         }
+      }
+
+      // 📸 CONTACTS_UPDATE - Atualiza foto de perfil quando contato muda
+      if (event === Events.CONTACTS_UPDATE) {
+        this.logger.verbose(`📸 Evento CONTACTS_UPDATE recebido para ${instance.instanceName}`);
+
+        for (const contactData of body) {
+          try {
+            const remoteJid = contactData.remoteJid;
+            const profilePicUrl = contactData.profilePicUrl;
+
+            if (!remoteJid || !profilePicUrl) {
+              this.logger.verbose(`Contato sem foto ou JID inválido: ${remoteJid}`);
+              continue;
+            }
+
+            // Busca o contato no Chatwoot
+            const chatId = remoteJid.split('@')[0].split(':')[0];
+            const contact = await this.findContact(instance, chatId);
+
+            if (contact) {
+              this.logger.log(`📸 Atualizando foto do contato ${chatId} no Chatwoot`);
+              await this.updateContact(instance, contact.id, {
+                avatar_url: profilePicUrl,
+              });
+              this.logger.log(`✅ Foto atualizada com sucesso para ${chatId}`);
+            } else {
+              this.logger.verbose(`Contato ${chatId} não encontrado no Chatwoot`);
+            }
+          } catch (error) {
+            this.logger.error(`Erro ao atualizar foto do contato: ${error.message}`);
+          }
+        }
+        return;
       }
     } catch (error) {
       const errorMsg = error?.message || String(error);

@@ -1613,15 +1613,37 @@ export class BaileysStartupService extends ChannelStartupService {
             this.localChatwoot?.enabled &&
             !received.key.id.includes('@broadcast')
           ) {
-            const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
-              Events.MESSAGES_UPSERT,
-              {
-                instanceName: this.instance.name,
-                instanceId: this.instanceId,
-              },
-              messageRaw,
-            );
+            // 🔄 Retry com backoff exponencial ao enviar mensagem recebida para o SoConnect
+            // 4 tentativas em ~25s (0s, 5s, 8s, 12s) - mesmo padrão das mensagens enviadas
+            let chatwootSentMessage;
 
+            try {
+              chatwootSentMessage = await this.retryWithBackoff(
+                async () => {
+                  return await this.chatwootService.eventWhatsapp(
+                    Events.MESSAGES_UPSERT,
+                    {
+                      instanceName: this.instance.name,
+                      instanceId: this.instanceId,
+                    },
+                    messageRaw,
+                  );
+                },
+                4, // 4 tentativas
+                `Enviar mensagem recebida para SoConnect [${received.key.id}]`,
+              );
+            } catch (error) {
+              // Após 4 tentativas falhadas, loga erro mas não quebra o fluxo
+              // O cron syncLostMessages vai pegar essa mensagem depois
+              const errorMsg = error?.message || String(error);
+              this.logger.error(
+                `❌ Falha ao enviar mensagem para SoConnect após 4 tentativas (~25s): ${errorMsg.substring(0, 200)}. ` +
+                  `Mensagem será sincronizada pelo cron syncLostMessages.`,
+              );
+              // Não lança erro - continua o fluxo normalmente
+            }
+
+            // ✅ Só marca como enviada se realmente conseguiu enviar
             if (chatwootSentMessage?.id) {
               messageRaw.chatwootMessageId = chatwootSentMessage.id;
               messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
@@ -2575,6 +2597,66 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Helper para retry com backoff exponencial
+   * 4 tentativas em ~25s (0s, 5s, 8s, 12s)
+   * Mesmo padrão usado no ChatwootService para mensagens enviadas
+   */
+  private async retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    maxAttempts: number = 4,
+    operationName: string = 'Operação',
+  ): Promise<T> {
+    // Delays customizados para ficar dentro de 25s
+    const delays = [0, 5000, 8000, 12000]; // 0s, 5s, 8s, 12s
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const result = await fn();
+
+        if (attempt > 1) {
+          this.logger.log(`✅ ${operationName} bem-sucedida na tentativa ${attempt}/${maxAttempts}`);
+        }
+
+        return result;
+      } catch (error) {
+        // Extrai mensagem de erro útil
+        let errorMsg = 'Erro desconhecido';
+        if (error?.message) {
+          errorMsg = error.message;
+        } else if (typeof error === 'object') {
+          errorMsg = JSON.stringify(error);
+        } else {
+          errorMsg = String(error);
+        }
+
+        const errorStatus = error?.status || error?.response?.status || 'unknown';
+
+        if (attempt === maxAttempts) {
+          this.logger.error(
+            `❌ ${operationName} falhou após ${maxAttempts} tentativas:\n` +
+              `  Erro: ${errorMsg.substring(0, 200)}\n` +
+              `  Status: ${errorStatus}`,
+          );
+          throw error; // Lança o erro original
+        }
+
+        const delayMs = delays[attempt] || 12000; // Fallback para 12s
+
+        this.logger.warn(
+          `⚠️ ${operationName} falhou (tentativa ${attempt}/${maxAttempts}):\n` +
+            `  Erro: ${errorMsg.substring(0, 100)}\n` +
+            `  Status: ${errorStatus}\n` +
+            `  Aguardando ${delayMs}ms antes da próxima tentativa...`,
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    throw new Error(`Failed after ${maxAttempts} attempts: ${operationName}`);
+  }
+
   private async sendMessage(
     sender: string,
     message: any,
@@ -3115,43 +3197,11 @@ export class BaileysStartupService extends ChannelStartupService {
       throw new BadRequestException('Text is required');
     }
 
-    // 🔍 DETECÇÃO DE RETRY: Verifica se mensagem similar foi enviada recentemente
-    if (isIntegration) {
-      const remoteJid = createJid(data.number);
-      const recentMessage = await this.prismaRepository.message.findFirst({
-        where: {
-          instanceId: this.instanceId,
-          key: {
-            path: ['remoteJid'],
-            equals: remoteJid,
-          },
-          message: {
-            path: ['conversation'],
-            string_contains: text.substring(0, 50), // Primeiros 50 chars
-          },
-          messageTimestamp: {
-            gte: Math.floor(Date.now() / 1000) - 300, // Últimos 5 minutos
-          },
-        },
-        orderBy: {
-          messageTimestamp: 'desc',
-        },
-      });
-
-      if (recentMessage?.chatwootMessageId) {
-        this.logger.warn(
-          `⚠️ [CHATWOOT RETRY] Mensagem similar detectada nos últimos 5min\n` +
-            `  - Número: ${data.number}\n` +
-            `  - Texto: ${text.substring(0, 30)}...\n` +
-            `  - Chatwoot ID anterior: ${recentMessage.chatwootMessageId}\n` +
-            `  - WhatsApp ID anterior: ${recentMessage.key['id']}\n` +
-            `  → Salvando flag no cache para bloquear webhook`,
-        );
-
-        const cacheKey = `chatwoot:retry:${this.instance.name}:${recentMessage.chatwootMessageId}`;
-        await this.cache.set(cacheKey, true, 300);
-      }
-    }
+    // 🔍 DETECÇÃO DE RETRY: Desabilitada temporariamente (causava erro com caracteres especiais)
+    // A detecção agora acontece apenas no webhook receiver do Chatwoot
+    // if (isIntegration) {
+    //   // Código removido para evitar erro de string_contains com caracteres especiais
+    // }
 
     return await this.sendMessageWithTyping(
       data.number,
@@ -3521,42 +3571,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (file) mediaData.media = file.buffer.toString('base64');
 
-    // 🔍 DETECÇÃO DE RETRY: Verifica se mídia similar foi enviada recentemente
-    if (isIntegration && data.caption) {
-      const remoteJid = createJid(data.number);
-      const recentMessage = await this.prismaRepository.message.findFirst({
-        where: {
-          instanceId: this.instanceId,
-          key: {
-            path: ['remoteJid'],
-            equals: remoteJid,
-          },
-          message: {
-            path: ['caption'],
-            string_contains: data.caption.substring(0, 50),
-          },
-          messageTimestamp: {
-            gte: Math.floor(Date.now() / 1000) - 300,
-          },
-        },
-        orderBy: {
-          messageTimestamp: 'desc',
-        },
-      });
-
-      if (recentMessage?.chatwootMessageId) {
-        this.logger.warn(
-          `⚠️ [CHATWOOT RETRY] Mídia similar detectada nos últimos 5min\n` +
-            `  - Número: ${data.number}\n` +
-            `  - Caption: ${data.caption?.substring(0, 30)}...\n` +
-            `  - Chatwoot ID anterior: ${recentMessage.chatwootMessageId}\n` +
-            `  → Salvando flag no cache`,
-        );
-
-        const cacheKey = `chatwoot:retry:${this.instance.name}:${recentMessage.chatwootMessageId}`;
-        await this.cache.set(cacheKey, true, 300);
-      }
-    }
+    // 🔍 DETECÇÃO DE RETRY: Desabilitada temporariamente (causava erro com caracteres especiais)
+    // A detecção agora acontece apenas no webhook receiver do Chatwoot
+    // if (isIntegration && data.caption) {
+    //   // Código removido para evitar erro de string_contains com caracteres especiais
+    // }
 
     const generate = await this.prepareMediaMessage(mediaData);
 
