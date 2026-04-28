@@ -10,7 +10,7 @@ type MountProps = {
 export class BaileysMessageProcessor {
   private processorLogs = new Logger('BaileysMessageProcessor');
   private subscription?: Subscription;
-  private sessionErrorCache = new Map<string, number>(); // Track SessionError occurrences
+  private sessionErrorCache = new Map<string, { timestamp: number; attempts: number }>(); // Track SessionError occurrences
 
   protected messageSubject = new Subject<{
     messages: WAMessage[];
@@ -24,11 +24,12 @@ export class BaileysMessageProcessor {
    */
   private filterProblematicMessages(messages: WAMessage[]): WAMessage[] {
     const now = Date.now();
-    const CACHE_EXPIRY = 30 * 60 * 1000; // 30 minutes - increased from 5 to reduce retry attempts
+    const CACHE_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours - apenas para limpar memória
+    const MAX_ATTEMPTS = 3; // Máximo de tentativas antes de descartar permanentemente
 
-    // Clean expired cache entries
-    for (const [key, timestamp] of this.sessionErrorCache.entries()) {
-      if (now - timestamp > CACHE_EXPIRY) {
+    // Clean expired cache entries (apenas para liberar memória)
+    for (const [key, data] of this.sessionErrorCache.entries()) {
+      if (now - data.timestamp > CACHE_EXPIRY) {
         this.sessionErrorCache.delete(key);
       }
     }
@@ -38,12 +39,16 @@ export class BaileysMessageProcessor {
 
       const messageKey = `${msg.key.remoteJid}_${msg.key.id}_${msg.key.participant || ''}`;
 
-      // If message has already caused SessionError, ignore it
-      if (this.sessionErrorCache.has(messageKey)) {
-        this.processorLogs.warn(
-          `Ignorando mensagem com erro de sessão conhecido: ${messageKey} (participante: ${msg.key.participant || 'N/A'})`,
-        );
-        return false;
+      // Se a mensagem já causou SessionError, verifica tentativas
+      const errorData = this.sessionErrorCache.get(messageKey);
+      if (errorData) {
+        if (errorData.attempts >= MAX_ATTEMPTS) {
+          // Descarta permanentemente após 3 tentativas
+          this.processorLogs.warn(
+            `❌ Mensagem descartada permanentemente após ${errorData.attempts} tentativas: ${messageKey}`,
+          );
+          return false;
+        }
       }
 
       return true;
@@ -56,20 +61,34 @@ export class BaileysMessageProcessor {
   private markMessageAsProblematic(msg: WAMessage) {
     if (!msg.key?.id || !msg.key?.remoteJid) return;
 
+    const MAX_ATTEMPTS = 3; // Máximo de tentativas antes de descartar
     const messageKey = `${msg.key.remoteJid}_${msg.key.id}_${msg.key.participant || ''}`;
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const contactKey = msg.key.participant || msg.key.remoteJid;
 
-    this.sessionErrorCache.set(messageKey, Date.now());
+    const existing = this.sessionErrorCache.get(messageKey);
+    const attempts = existing ? existing.attempts + 1 : 1;
 
-    this.processorLogs.warn(
-      `Mensagem marcada como problemática devido a erro de sessão: ${messageKey} ` +
-        `(de: ${msg.key.participant || msg.key.remoteJid})`,
-    );
+    this.sessionErrorCache.set(messageKey, {
+      timestamp: Date.now(),
+      attempts,
+    });
 
-    // Log adicional para diagnóstico de PreKey errors
+    if (attempts >= MAX_ATTEMPTS) {
+      this.processorLogs.error(
+        `🗑️ SessionError - Mensagem será descartada (tentativa ${attempts}/3): ${messageKey} ` +
+          `(de: ${msg.key.participant || msg.key.remoteJid})`,
+      );
+    } else {
+      this.processorLogs.warn(
+        `⚠️ SessionError - Tentativa ${attempts}/3 falhou: ${messageKey} ` +
+          `(de: ${msg.key.participant || msg.key.remoteJid})`,
+      );
+    }
+
+    // Log adicional para diagnóstico
     this.processorLogs.warn(
-      `Detalhes do erro: remoteJid=${msg.key.remoteJid}, participant=${msg.key.participant || 'N/A'}, ` +
+      `Detalhes: remoteJid=${msg.key.remoteJid}, participant=${msg.key.participant || 'N/A'}, ` +
         `messageId=${msg.key.id}, fromMe=${msg.key.fromMe || false}`,
     );
   }

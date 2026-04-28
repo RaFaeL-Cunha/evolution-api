@@ -25,6 +25,14 @@ const getTypeMessage = (msg: any) => {
     responseRowId: msg?.message?.listResponseMessage?.singleSelectReply?.selectedRowId,
     templateButtonReplyMessage:
       msg?.message?.templateButtonReplyMessage?.selectedId || msg?.message?.buttonsResponseMessage?.selectedButtonId,
+    // Reactions (reações com emoji)
+    reactionMessage: msg?.message?.reactionMessage
+      ? `reactionMessage|${msg.message.reactionMessage.text}|${msg.message.reactionMessage.key?.id || ''}`
+      : undefined,
+    // Album Message (múltiplas fotos/vídeos)
+    albumMessage: msg?.message?.albumMessage
+      ? `albumMessage|${mediaId}${msg?.message?.albumMessage?.caption ? `|${msg?.message?.albumMessage?.caption}` : ''}`
+      : undefined,
     // Medias
     audioMessage: msg?.message?.speechToText
       ? msg?.message?.speechToText
@@ -37,6 +45,7 @@ const getTypeMessage = (msg: any) => {
     videoMessage: msg?.message?.videoMessage
       ? `videoMessage|${mediaId}${msg?.message?.videoMessage?.caption ? `|${msg?.message?.videoMessage?.caption}` : ''}`
       : undefined,
+    stickerMessage: msg?.message?.stickerMessage ? `stickerMessage|${mediaId}` : undefined,
     documentMessage: msg?.message?.documentMessage
       ? `documentMessage|${mediaId}${
           msg?.message?.documentMessage?.caption ? `|${msg?.message?.documentMessage?.caption}` : ''

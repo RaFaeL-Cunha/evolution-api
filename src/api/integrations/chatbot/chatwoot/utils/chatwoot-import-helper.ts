@@ -594,38 +594,48 @@ class ChatwootImport {
 
       let phoneNumber = key?.remoteJid?.split('@')[0];
 
-      // 🔧 Se for LID, tenta buscar número real no cache IsOnWhatsapp
-      if (key?.remoteJid?.includes('@lid')) {
-        // Primeiro tenta usar remoteJidAlt se existir
-        if (key.remoteJidAlt && !key.remoteJidAlt.includes('@lid')) {
-          phoneNumber = key.remoteJidAlt.split('@')[0];
-          this.logger.verbose(`✅ LID convertido usando remoteJidAlt: ${key.remoteJid} → ${key.remoteJidAlt}`);
-        } else if (prismaRepository) {
-          // Busca no cache IsOnWhatsapp
-          try {
-            const cached = await prismaRepository.isOnWhatsapp.findFirst({
-              where: {
-                OR: [{ jidOptions: { contains: key.remoteJid } }, { remoteJid: key.remoteJid }],
-              },
-            });
+      // 🔧 Trata todos os cenarios de LID (pode estar no remoteJid OU no remoteJidAlt)
+      const isLidInRemoteJid = key?.remoteJid?.includes('@lid');
+      const isLidInRemoteJidAlt = key?.remoteJidAlt?.includes('@lid');
 
-            if (cached?.remoteJid && !cached.remoteJid.includes('@lid')) {
-              phoneNumber = cached.remoteJid.split('@')[0];
-              this.logger.verbose(`✅ LID convertido usando cache: ${key.remoteJid} → ${cached.remoteJid}`);
-            } else {
-              this.logger.verbose(`⚠️ LID sem conversão disponível: ${key.remoteJid} - pulando importação`);
-              continue;
-            }
-          } catch {
-            this.logger.verbose(`⚠️ Erro ao buscar LID no cache: ${key.remoteJid} - pulando importação`);
+      // Cenario 1: LID no remoteJid, numero normal no remoteJidAlt
+      if (isLidInRemoteJid && key.remoteJidAlt && !isLidInRemoteJidAlt) {
+        phoneNumber = key.remoteJidAlt.split('@')[0];
+        this.logger.verbose(`✅ LID no remoteJid, usando remoteJidAlt: ${key.remoteJid} → ${key.remoteJidAlt}`);
+      }
+      // Cenario 2: LID no remoteJidAlt, numero normal no remoteJid
+      else if (isLidInRemoteJidAlt && !isLidInRemoteJid) {
+        phoneNumber = key.remoteJid.split('@')[0];
+        this.logger.verbose(`✅ LID no remoteJidAlt, usando remoteJid: ${key.remoteJidAlt} → ${key.remoteJid}`);
+      }
+      // Cenario 3: LID no remoteJid, sem remoteJidAlt (busca no cache)
+      else if (isLidInRemoteJid && prismaRepository) {
+        // Busca no cache IsOnWhatsapp
+        try {
+          const cached = await prismaRepository.isOnWhatsapp.findFirst({
+            where: {
+              OR: [{ jidOptions: { contains: key.remoteJid } }, { remoteJid: key.remoteJid }],
+            },
+          });
+
+          if (cached?.remoteJid && !cached.remoteJid.includes('@lid')) {
+            phoneNumber = cached.remoteJid.split('@')[0];
+            this.logger.verbose(`✅ LID convertido usando cache: ${key.remoteJid} → ${cached.remoteJid}`);
+          } else {
+            this.logger.verbose(`⚠️ LID sem conversao disponivel: ${key.remoteJid} - pulando importacao`);
             continue;
           }
-        } else {
-          this.logger.verbose(
-            `⚠️ Mensagem com LID detectada: ${key.remoteJid} - pulando importação (sem acesso ao cache)`,
-          );
+        } catch {
+          this.logger.verbose(`⚠️ Erro ao buscar LID no cache: ${key.remoteJid} - pulando importacao`);
           continue;
         }
+      }
+      // Cenario 4: LID no remoteJid, sem cache disponivel
+      else if (isLidInRemoteJid) {
+        this.logger.verbose(
+          `⚠️ Mensagem com LID detectada: ${key.remoteJid} - pulando importacao (sem acesso ao cache)`,
+        );
+        continue;
       }
 
       if (phoneNumber) {

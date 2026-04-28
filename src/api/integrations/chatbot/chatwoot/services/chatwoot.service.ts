@@ -829,20 +829,32 @@ export class ChatwootService {
     const { remoteJid } = body.key;
     const isGroup = remoteJid.endsWith('@g.us');
 
-    // Verifica se remoteJid e realmente LID (contem @lid)
-    const isLid = remoteJid.includes('@lid');
+    // Verifica se remoteJid ou remoteJidAlt contem LID
+    const isLidInRemoteJid = remoteJid.includes('@lid');
+    const isLidInRemoteJidAlt = body.key.remoteJidAlt?.includes('@lid');
 
-    // Se for LID, usa remoteJidAlt (numero normal), senao usa remoteJid
-    // FALLBACK: Se remoteJidAlt nao existir, extrai o numero do proprio LID
+    // Determina qual campo tem o numero normal (sem @lid)
     let phoneNumber: string;
-    if (isLid && !isGroup) {
-      if (body.key.remoteJidAlt) {
+    if (!isGroup) {
+      // Cenario 1: LID esta no remoteJid, numero normal no remoteJidAlt
+      if (isLidInRemoteJid && body.key.remoteJidAlt && !isLidInRemoteJidAlt) {
         phoneNumber = body.key.remoteJidAlt;
-      } else {
-        // Fallback: extrai o numero do LID (formato: 259218573639812@lid)
+        this.logger.verbose(`Cenario 1: LID no remoteJid, usando remoteJidAlt: ${phoneNumber}`);
+      }
+      // Cenario 2: LID esta no remoteJidAlt, numero normal no remoteJid
+      else if (isLidInRemoteJidAlt && !isLidInRemoteJid) {
+        phoneNumber = remoteJid;
+        this.logger.verbose(`Cenario 2: LID no remoteJidAlt, usando remoteJid: ${phoneNumber}`);
+      }
+      // Cenario 3: LID no remoteJid, sem remoteJidAlt (fallback)
+      else if (isLidInRemoteJid && !body.key.remoteJidAlt) {
         const lidNumber = remoteJid.split('@')[0].split(':')[0];
         phoneNumber = `${lidNumber}@s.whatsapp.net`;
-        this.logger.warn(`remoteJidAlt nao disponivel para LID ${remoteJid}, usando fallback: ${phoneNumber}`);
+        this.logger.warn(`Cenario 3: LID sem remoteJidAlt, usando fallback: ${phoneNumber}`);
+      }
+      // Cenario 4: Nenhum LID, usa remoteJid normal
+      else {
+        phoneNumber = remoteJid;
       }
     } else {
       phoneNumber = remoteJid;
@@ -850,7 +862,7 @@ export class ChatwootService {
 
     if (!phoneNumber && !isGroup) {
       this.logger.error(
-        `phoneNumber is null - isLid: ${isLid}, isGroup: ${isGroup}, remoteJid: ${remoteJid}, remoteJidAlt: ${body.key.remoteJidAlt}`,
+        `phoneNumber is null - remoteJid: ${remoteJid}, remoteJidAlt: ${body.key.remoteJidAlt}, isLidInRemoteJid: ${isLidInRemoteJid}, isLidInRemoteJidAlt: ${isLidInRemoteJidAlt}`,
       );
     }
 
@@ -859,7 +871,9 @@ export class ChatwootService {
     const cacheKey = `${instance.instanceName}:createConversation-${normalizedKey}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${normalizedKey}`;
 
-    this.logger.verbose(`Normalized key: ${normalizedKey} (isLid: ${isLid}, remoteJid: ${remoteJid})`);
+    this.logger.verbose(
+      `Normalized key: ${normalizedKey} (remoteJid: ${remoteJid}, remoteJidAlt: ${body.key.remoteJidAlt})`,
+    );
     const maxWaitTime = 5000; // 5 seconds
 
     // Tenta obter client do Chatwoot
@@ -882,7 +896,7 @@ export class ChatwootService {
 
           if (needsUpdate) {
             this.logger.log(
-              `🔄 Atualizando identifier do contato: ${contact.identifier} → ${phoneNumber} (LID: ${isLid})`,
+              `🔄 Atualizando identifier do contato: ${contact.identifier} → ${phoneNumber} (LID: ${isLidInRemoteJid || isLidInRemoteJidAlt})`,
             );
 
             try {
@@ -1029,7 +1043,7 @@ export class ChatwootService {
 
           // Pega o participante correto, preferindo participantAlt se disponível e não for LID
           let participantJid = body.key.participant;
-          if (isLid && !body.key.fromMe && body.key.participantAlt) {
+          if ((isLidInRemoteJid || isLidInRemoteJidAlt) && !body.key.fromMe && body.key.participantAlt) {
             // Se participantAlt não contém @lid, usa ele (é o número real)
             if (!body.key.participantAlt.includes('@lid')) {
               participantJid = body.key.participantAlt;
@@ -1040,7 +1054,7 @@ export class ChatwootService {
 
           if (!participantJid) {
             this.logger.warn(
-              `participantJid is null - group: ${chatId}, isLid: ${isLid}, fromMe: ${body.key.fromMe}, participantAlt: ${body.key.participantAlt}, participant: ${body.key.participant}`,
+              `participantJid is null - group: ${chatId}, isLidInRemoteJid: ${isLidInRemoteJid}, isLidInRemoteJidAlt: ${isLidInRemoteJidAlt}, fromMe: ${body.key.fromMe}, participantAlt: ${body.key.participantAlt}, participant: ${body.key.participant}`,
             );
             await this.cache.delete(lockKey);
             return null;
