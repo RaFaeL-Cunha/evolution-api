@@ -92,7 +92,7 @@ async function retryWithBackoff<T>(
             `  Status: ${errorStatus}\n` +
             `  Tipo: ${error?.code || 'unknown'}`,
         );
-        throw new Error(`Failed after ${maxAttempts} attempts: ${operationName} - ${errorMsg}`);
+        throw new Error(`Falhou apos ${maxAttempts} tentativas: ${operationName} - ${errorMsg}`);
       }
 
       const delayMs = delays[attempt] || 12000; // Fallback para 12s
@@ -108,7 +108,7 @@ async function retryWithBackoff<T>(
     }
   }
 
-  throw new Error(`Failed after ${maxAttempts} attempts: ${operationName}`);
+  throw new Error(`Falhou apos ${maxAttempts} tentativas: ${operationName}`);
 }
 
 /**
@@ -610,9 +610,16 @@ export class ChatwootService {
 
     let query: any;
     const isGroup = phoneNumber.includes('@g.us');
+    const isLid = phoneNumber.includes('@lid');
 
     if (!isGroup) {
-      query = `+${phoneNumber}`;
+      // Remove @lid ou @s.whatsapp.net para buscar apenas o numero
+      const cleanNumber = phoneNumber.split('@')[0].split(':')[0];
+      query = `+${cleanNumber}`;
+
+      if (isLid) {
+        this.logger.verbose(`Buscando contato LID: ${phoneNumber} -> query: ${query}`);
+      }
     } else {
       query = phoneNumber;
     }
@@ -625,6 +632,19 @@ export class ChatwootService {
         q: query,
       });
     } else {
+      // Tenta buscar por identifier primeiro (para LID)
+      if (isLid) {
+        try {
+          const contactByIdentifier = await this.findContactByIdentifier(instance, phoneNumber);
+          if (contactByIdentifier) {
+            this.logger.verbose(`Contato LID encontrado por identifier: ${contactByIdentifier.id}`);
+            return contactByIdentifier;
+          }
+        } catch (error) {
+          this.logger.verbose(`Erro ao buscar por identifier, tentando por numero: ${error.message}`);
+        }
+      }
+
       contact = await chatwootRequest(this.getClientCwConfig(), {
         method: 'POST',
         url: `/api/v1/accounts/${this.provider.accountId}/contacts/filter`,
@@ -809,24 +829,37 @@ export class ChatwootService {
     const { remoteJid } = body.key;
     const isGroup = remoteJid.endsWith('@g.us');
 
-    // 🔧 FIX: Verifica se remoteJid é realmente LID (contém @lid)
+    // Verifica se remoteJid e realmente LID (contem @lid)
     const isLid = remoteJid.includes('@lid');
 
-    // Se for LID, usa remoteJidAlt (número normal), senão usa remoteJid
-    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : remoteJid;
+    // Se for LID, usa remoteJidAlt (numero normal), senao usa remoteJid
+    // FALLBACK: Se remoteJidAlt nao existir, extrai o numero do proprio LID
+    let phoneNumber: string;
+    if (isLid && !isGroup) {
+      if (body.key.remoteJidAlt) {
+        phoneNumber = body.key.remoteJidAlt;
+      } else {
+        // Fallback: extrai o numero do LID (formato: 259218573639812@lid)
+        const lidNumber = remoteJid.split('@')[0].split(':')[0];
+        phoneNumber = `${lidNumber}@s.whatsapp.net`;
+        this.logger.warn(`remoteJidAlt nao disponivel para LID ${remoteJid}, usando fallback: ${phoneNumber}`);
+      }
+    } else {
+      phoneNumber = remoteJid;
+    }
 
     if (!phoneNumber && !isGroup) {
-      this.logger.warn(
+      this.logger.error(
         `phoneNumber is null - isLid: ${isLid}, isGroup: ${isGroup}, remoteJid: ${remoteJid}, remoteJidAlt: ${body.key.remoteJidAlt}`,
       );
     }
 
-    // 🔧 FIX: Usa phoneNumber como chave para unificar LID e JID normal
+    // Usa phoneNumber como chave para unificar LID e JID normal
     const normalizedKey = isGroup ? remoteJid : phoneNumber || remoteJid;
     const cacheKey = `${instance.instanceName}:createConversation-${normalizedKey}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${normalizedKey}`;
 
-    this.logger.verbose(`🔑 Normalized key: ${normalizedKey} (isLid: ${isLid}, remoteJid: ${remoteJid})`);
+    this.logger.verbose(`Normalized key: ${normalizedKey} (isLid: ${isLid}, remoteJid: ${remoteJid})`);
     const maxWaitTime = 5000; // 5 seconds
 
     // Tenta obter client do Chatwoot
@@ -2048,17 +2081,17 @@ export class ChatwootService {
 
             let messageSent: any;
             try {
-              // 🔄 Retry automático: 4 tentativas (~25 segundos total)
+              // Retry automatico: 4 tentativas (~25 segundos total)
               messageSent = await retryWithBackoff(
                 async () => {
                   const result = await waInstance?.textMessage(data, true);
                   if (!result) {
-                    throw new Error('Message not sent');
+                    throw new Error('Mensagem nao foi enviada');
                   }
                   return result;
                 },
                 4,
-                `Enviar mensagem do SoConnect para WhatsApp (${chatId})`,
+                `Enviar mensagem para ${chatId}`,
               );
 
               if (Long.isLong(messageSent?.messageTimestamp)) {
@@ -2078,25 +2111,76 @@ export class ChatwootService {
                 instance,
               );
             } catch (error) {
-              // ❌ TODOS os erros devem ficar vermelhos no Chatwoot
-              // Mensagem não foi enviada = usuário precisa saber
+              // Mensagem de erro sempre em portugues, clara e com o numero
 
-              // Extrai informação útil do erro
+              // Extrai informacao util do erro
               let errorDetails = 'Erro desconhecido';
-              let userFriendlyMessage = 'Não foi possível enviar a mensagem. Verifique sua conexão.';
+              let userFriendlyMessage = `Nao foi possivel enviar mensagem para ${chatId}`;
 
               if (error?.message) {
                 errorDetails = error.message;
+
+                // Traduz erros comuns para portugues claro (sempre mostra o numero)
+                if (errorDetails.includes('Connection Closed') || errorDetails.includes('connection closed')) {
+                  userFriendlyMessage = `WhatsApp temporariamente desconectado. Nao foi possivel enviar para ${chatId}`;
+                } else if (
+                  errorDetails.includes('presenceSubscribe') ||
+                  errorDetails.includes('client not connected') ||
+                  errorDetails.includes('reconectando')
+                ) {
+                  userFriendlyMessage = `WhatsApp esta reconectando. Nao foi possivel enviar para ${chatId}`;
+                } else if (
+                  errorDetails.includes('Timed out') ||
+                  errorDetails.includes('timeout') ||
+                  errorDetails.includes('Tempo esgotado')
+                ) {
+                  userFriendlyMessage = `Tempo esgotado ao enviar para ${chatId}`;
+                } else if (
+                  errorDetails.includes('rate limit') ||
+                  errorDetails.includes('too many requests') ||
+                  errorDetails.includes('Muitas mensagens')
+                ) {
+                  userFriendlyMessage = `Muitas mensagens enviadas. Aguarde alguns minutos`;
+                } else if (
+                  errorDetails.includes('Mensagem nao foi enviada') ||
+                  errorDetails.includes('Message not sent') ||
+                  errorDetails.includes('Failed to send')
+                ) {
+                  userFriendlyMessage = `Falha ao enviar para ${chatId}. Verifique se o WhatsApp esta conectado`;
+                } else if (
+                  errorDetails.includes('Invalid number') ||
+                  errorDetails.includes('not a valid') ||
+                  errorDetails.includes('invalido')
+                ) {
+                  userFriendlyMessage = `Numero ${chatId} invalido`;
+                } else if (
+                  errorDetails.includes('blocked') ||
+                  errorDetails.includes('Blocked') ||
+                  errorDetails.includes('bloqueado')
+                ) {
+                  userFriendlyMessage = `Nao foi possivel enviar para ${chatId}. O numero pode ter bloqueado o contato`;
+                } else if (
+                  errorDetails.includes('not registered') ||
+                  errorDetails.includes('not on WhatsApp') ||
+                  errorDetails.includes('nao esta cadastrado')
+                ) {
+                  userFriendlyMessage = `O numero ${chatId} nao esta no WhatsApp`;
+                } else {
+                  // Erro generico mas em portugues (sempre mostra o numero)
+                  userFriendlyMessage = `Nao foi possivel enviar para ${chatId}. Tente novamente`;
+                }
               } else if (typeof error === 'object') {
-                // Se o erro for um objeto (ex: BadRequestException com dados do número)
+                // Se o erro for um objeto (ex: BadRequestException com dados do numero)
                 if (error?.exists === false) {
-                  errorDetails = `Número ${chatId} não está no WhatsApp`;
-                  userFriendlyMessage = `❌ O número ${chatId} não existe no WhatsApp. Verifique o número e tente novamente.`;
+                  errorDetails = `Numero ${chatId} nao esta no WhatsApp`;
+                  userFriendlyMessage = `O numero ${chatId} nao existe no WhatsApp`;
                 } else {
                   errorDetails = JSON.stringify(error);
+                  userFriendlyMessage = `Erro ao enviar para ${chatId}. Verifique sua conexao`;
                 }
               } else {
                 errorDetails = String(error);
+                userFriendlyMessage = `Erro ao enviar para ${chatId}. Tente novamente`;
               }
 
               this.logger.error(
@@ -2112,13 +2196,8 @@ export class ChatwootService {
                 this.onSendMessageError(instance, body.conversation?.id, error);
               }
 
-              // Lança erro limpo e amigável para Chatwoot
-              const cleanError = new Error(
-                error?.exists === false
-                  ? userFriendlyMessage
-                  : `Falha ao enviar mensagem após 4 tentativas. ${errorDetails.split('\n')[0]}`,
-              );
-              throw cleanError;
+              // Lanca erro limpo e amigavel para Chatwoot (sempre em portugues, sem prefixos tecnicos)
+              throw new Error(userFriendlyMessage);
             }
           }
         }

@@ -231,6 +231,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
   private preKeyErrorTracker = new Map<string, { count: number; lastError: number }>(); // Track PreKey errors by contact
   private failedMessages = new Map<string, Array<{ message: any; timestamp: number; attempts: number }>>(); // Store failed messages by contact
+  private profilePictureCache = new Map<string, { url: string | null; timestamp: number }>(); // Cache de fotos de perfil
 
   constructor(
     public readonly configService: ConfigService,
@@ -248,6 +249,9 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     this.authStateProvider = new AuthStateProvider(this.providerFiles);
+
+    // Inicia limpeza periódica de sessões problemáticas (a cada 10 minutos)
+    this.startPeriodicSessionCleanup();
   }
 
   private authStateProvider: AuthStateProvider;
@@ -259,6 +263,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private sessionCleanupInterval: NodeJS.Timeout | null = null;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -273,6 +278,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    // Limpa o intervalo de limpeza de sessões
+    if (this.sessionCleanupInterval) {
+      clearInterval(this.sessionCleanupInterval);
+      this.sessionCleanupInterval = null;
+    }
+
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -431,6 +442,16 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
+
+      // 🔧 FIX PR #2402: Previne loop infinito de reconexão durante geração de QR code
+      // Se é a primeira conexão (sem wuid e sem QR gerado), aguarda o QR aparecer
+      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+
+      if (isInitialConnection) {
+        this.logger.info('Initial connection closed, waiting for QR code generation...');
+        return;
+      }
+
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
@@ -564,6 +585,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  // 🔧 FIX PR #2427: Cache key para rastrear se MESSAGES_UPSERT já foi emitido para áudio
+  private getUpsertEmittedCacheKey(messageId: string) {
+    return `upsert_emitted_${this.instanceId}_${messageId}`;
+  }
+
   private async defineAuthState() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -689,17 +715,15 @@ export class BaileysStartupService extends ChannelStartupService {
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
       patchMessageBeforeSending(message) {
+        // 🔧 FIX PR #2461: Remove JSON.parse(JSON.stringify()) que quebrava objetos Protobuf Long
+        // Agora muta diretamente o listType preservando a prototype chain
         if (
           message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
         ) {
-          message = JSON.parse(JSON.stringify(message));
-
           message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
         }
 
         if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
-          message = JSON.parse(JSON.stringify(message));
-
           message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
         }
 
@@ -1807,6 +1831,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
+          // 🔧 FIX PR #2427: Marca mensagens de áudio recebidas como emitidas no cache
+          // Isso previne que o fallback no messages.update emita duplicatas
+          if (messageRaw.messageType === 'audioMessage' && !messageRaw.key.fromMe && messageRaw.key.id) {
+            await this.baileysCache.set(this.getUpsertEmittedCacheKey(messageRaw.key.id), true, 60 * 10);
+          }
+
           await chatbotController.emit({
             instance: {
               instanceName: this.instance.name,
@@ -1826,15 +1856,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const contactRaw: {
             remoteJid: string;
+            remoteJidAlt?: string;
             pushName: string;
             profilePicUrl?: string;
             instanceId: string;
           } = {
             remoteJid: received.key.remoteJid,
+            remoteJidAlt: received.key.remoteJidAlt,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
             profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
+
+          // Se não conseguiu buscar foto com o LID, tenta com o JID alternativo
+          if (!contactRaw.profilePicUrl && contactRaw.remoteJidAlt && contactRaw.remoteJid.includes('@lid')) {
+            this.logger.verbose(
+              `Tentando buscar foto com JID alternativo: ${contactRaw.remoteJidAlt} (LID: ${contactRaw.remoteJid})`,
+            );
+            const altPicture = await this.profilePicture(contactRaw.remoteJidAlt);
+            if (altPicture.profilePictureUrl) {
+              contactRaw.profilePicUrl = altPicture.profilePictureUrl;
+              this.logger.verbose(`✅ Foto encontrada usando JID alternativo`);
+            }
+          }
 
           if (contactRaw.remoteJid === 'status@broadcast') {
             continue;
@@ -1852,47 +1896,54 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (contact) {
-            this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
+            // ✅ Só envia evento CONTACTS_UPDATE se a foto realmente mudou
+            if (this.hasProfilePictureChanged(contactRaw.remoteJid, contactRaw.profilePicUrl)) {
+              this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
 
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-              await this.chatwootService.eventWhatsapp(
-                Events.CONTACTS_UPDATE,
-                {
-                  instanceName: this.instance.name,
-                  instanceId: this.instanceId,
-                },
-                contactRaw,
-              );
+              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                await this.chatwootService.eventWhatsapp(
+                  Events.CONTACTS_UPDATE,
+                  {
+                    instanceName: this.instance.name,
+                    instanceId: this.instanceId,
+                  },
+                  contactRaw,
+                );
+              }
             }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              const { remoteJidAlt, ...contactData } = contactRaw;
               await this.prismaRepository.contact.upsert({
                 where: {
                   remoteJid_instanceId: {
-                    remoteJid: contactRaw.remoteJid,
-                    instanceId: contactRaw.instanceId,
+                    remoteJid: contactData.remoteJid,
+                    instanceId: contactData.instanceId,
                   },
                 },
-                create: contactRaw,
-                update: contactRaw,
+                create: contactData,
+                update: contactData,
               });
+            }
 
             continue;
           }
 
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+            const { remoteJidAlt, ...contactData } = contactRaw;
             await this.prismaRepository.contact.upsert({
               where: {
                 remoteJid_instanceId: {
-                  remoteJid: contactRaw.remoteJid,
-                  instanceId: contactRaw.instanceId,
+                  remoteJid: contactData.remoteJid,
+                  instanceId: contactData.instanceId,
                 },
               },
-              update: contactRaw,
-              create: contactRaw,
+              update: contactData,
+              create: contactData,
             });
+          }
         }
       } catch (error) {
         this.logger.error(error);
@@ -1989,6 +2040,38 @@ export class BaileysStartupService extends ChannelStartupService {
               continue;
             }
             message.messageId = findMessage.id;
+
+            // 🔧 FIX PR #2427: Fallback para mensagens de áudio que não tiveram MESSAGES_UPSERT emitido
+            // Algumas mensagens de áudio podem ter o update antes do upsert devido a timing
+            if (!key.fromMe && findMessage.messageType === 'audioMessage' && key.id) {
+              const upsertCacheKey = this.getUpsertEmittedCacheKey(key.id);
+              const alreadyEmitted = await this.baileysCache.get(upsertCacheKey);
+
+              if (!alreadyEmitted) {
+                const fallbackUpsertPayload = {
+                  key: findMessage.key,
+                  pushName: findMessage.pushName,
+                  status: findMessage.status,
+                  message: findMessage.message,
+                  contextInfo: findMessage.contextInfo,
+                  messageType: findMessage.messageType,
+                  messageTimestamp: findMessage.messageTimestamp,
+                  instanceId: findMessage.instanceId,
+                  source: findMessage.source,
+                };
+
+                try {
+                  await this.sendDataWebhook(Events.MESSAGES_UPSERT, fallbackUpsertPayload);
+                  await this.baileysCache.set(upsertCacheKey, true, 60 * 10);
+                  this.logger.warn(`Fallback messages.upsert emitted for audio message ${key.id}`);
+                } catch (error) {
+                  this.logger.error([
+                    `Failed to emit fallback messages.upsert for audio message ${key.id}`,
+                    error?.message,
+                  ]);
+                }
+              }
+            }
           }
 
           if (update.message === null && update.status === undefined) {
@@ -2654,7 +2737,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
-    throw new Error(`Failed after ${maxAttempts} attempts: ${operationName}`);
+    throw new Error(`Falhou após ${maxAttempts} tentativas: ${operationName}`);
   }
 
   private async sendMessage(
@@ -2846,39 +2929,55 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.logger.verbose(`Sending message to ${sender}`);
 
+    // 🔧 FIX: Verifica se client está disponível antes de usar
+    if (!this.client) {
+      this.logger.error(`❌ Client não disponível para enviar mensagem para ${sender}`);
+      throw new Error('WhatsApp está reconectando. Aguarde alguns instantes e tente novamente.');
+    }
+
     try {
       if (options?.delay) {
         this.logger.verbose(`Typing for ${options.delay}ms to ${sender}`);
         if (options.delay > 20000) {
           let remainingDelay = options.delay;
-          while (remainingDelay > 20000) {
-            await this.client.presenceSubscribe(sender);
-
-            await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
+          while (remainingDelay > 0 && remainingDelay > 20000) {
+            // 🔧 FIX: Verifica client antes de cada uso
+            if (this.client) {
+              await this.client.presenceSubscribe(sender);
+              await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
+            }
 
             await delay(20000);
 
-            await this.client.sendPresenceUpdate('paused', sender);
+            if (this.client) {
+              await this.client.sendPresenceUpdate('paused', sender);
+            }
 
             remainingDelay -= 20000;
           }
           if (remainingDelay > 0) {
-            await this.client.presenceSubscribe(sender);
-
-            await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
+            if (this.client) {
+              await this.client.presenceSubscribe(sender);
+              await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
+            }
 
             await delay(remainingDelay);
 
-            await this.client.sendPresenceUpdate('paused', sender);
+            if (this.client) {
+              await this.client.sendPresenceUpdate('paused', sender);
+            }
           }
         } else {
-          await this.client.presenceSubscribe(sender);
-
-          await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
+          if (this.client) {
+            await this.client.presenceSubscribe(sender);
+            await this.client.sendPresenceUpdate((options.presence as WAPresence) ?? 'composing', sender);
+          }
 
           await delay(options.delay);
 
-          await this.client.sendPresenceUpdate('paused', sender);
+          if (this.client) {
+            await this.client.sendPresenceUpdate('paused', sender);
+          }
         }
       }
 
@@ -2916,7 +3015,8 @@ export class BaileysStartupService extends ChannelStartupService {
           throw new NotFoundException('Group not found');
         }
 
-        if (options?.mentionsEveryOne) {
+        // 🔧 FIX PR #2470: Usa strict equality para evitar truthy bug com string "false"
+        if (options?.mentionsEveryOne === true) {
           mentions = group.participants.map((participant) => participant.id);
         } else if (options?.mentioned?.length) {
           mentions = options.mentioned.map((mention) => {
@@ -4315,7 +4415,10 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const keys: proto.IMessageKey[] = [];
       data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
+        // 🔧 FIX PR #2418: Usa denylist ao invés de allowlist para incluir LID e usuários normais
+        // Antes: isJidGroup || isPnUser (excluía @s.whatsapp.net e @lid)
+        // Agora: exclui apenas broadcast e newsletter
+        if (!isJidBroadcast(read.remoteJid) && !isJidNewsletter(read.remoteJid)) {
           keys.push({
             remoteJid: read.remoteJid,
             fromMe: read.fromMe,
@@ -5746,6 +5849,91 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
+   * Verifica se a foto de perfil mudou desde a última verificação
+   * @param remoteJid - JID do contato
+   * @param currentUrl - URL atual da foto
+   * @returns true se a foto mudou ou é a primeira verificação
+   */
+  private hasProfilePictureChanged(remoteJid: string, currentUrl: string | null): boolean {
+    const CACHE_TTL = 30 * 60 * 1000; // 30 minutos
+    const now = Date.now();
+    const cached = this.profilePictureCache.get(remoteJid);
+
+    // Se não tem cache ou o cache expirou, considera como mudança
+    if (!cached || now - cached.timestamp > CACHE_TTL) {
+      this.profilePictureCache.set(remoteJid, { url: currentUrl, timestamp: now });
+      return true;
+    }
+
+    // Se a URL mudou, atualiza o cache e retorna true
+    if (cached.url !== currentUrl) {
+      this.profilePictureCache.set(remoteJid, { url: currentUrl, timestamp: now });
+      this.logger.verbose(`📸 Foto de perfil mudou para ${remoteJid}: ${cached.url} → ${currentUrl}`);
+      return true;
+    }
+
+    // Foto não mudou
+    this.logger.verbose(`ℹ️ Foto de perfil não mudou para ${remoteJid}, ignorando evento`);
+    return false;
+  }
+
+  /**
+   * Inicia limpeza periódica de sessões problemáticas
+   */
+  private startPeriodicSessionCleanup() {
+    // Executa a cada 10 minutos
+    this.sessionCleanupInterval = setInterval(
+      async () => {
+        try {
+          const now = Date.now();
+          const MAX_ERROR_AGE = 30 * 60 * 1000; // 30 minutos
+
+          // Limpa erros antigos do tracker
+          for (const [jid, errorInfo] of this.preKeyErrorTracker.entries()) {
+            if (now - errorInfo.lastError > MAX_ERROR_AGE) {
+              this.logger.verbose(`Limpando erro antigo de PreKey para ${jid} (${errorInfo.count} erros)`);
+              this.preKeyErrorTracker.delete(jid);
+            }
+          }
+
+          // Limpa mensagens antigas que não puderam ser recuperadas
+          for (const [jid, messages] of this.failedMessages.entries()) {
+            const validMessages = messages.filter((m) => now - m.timestamp < MAX_ERROR_AGE);
+
+            if (validMessages.length === 0) {
+              this.logger.verbose(`Limpando mensagens antigas não recuperadas de ${jid}`);
+              this.failedMessages.delete(jid);
+            } else if (validMessages.length < messages.length) {
+              this.logger.verbose(`Limpando ${messages.length - validMessages.length} mensagens antigas de ${jid}`);
+              this.failedMessages.set(jid, validMessages);
+            }
+          }
+
+          // Limpa cache de fotos antigas (60 minutos)
+          const MAX_CACHE_AGE = 60 * 60 * 1000;
+          for (const [jid, cached] of this.profilePictureCache.entries()) {
+            if (now - cached.timestamp > MAX_CACHE_AGE) {
+              this.profilePictureCache.delete(jid);
+            }
+          }
+
+          // Log de status se houver itens sendo rastreados
+          if (this.preKeyErrorTracker.size > 0 || this.failedMessages.size > 0) {
+            this.logger.verbose(
+              `Status de recuperação: ${this.preKeyErrorTracker.size} contato(s) com erro, ` +
+                `${this.failedMessages.size} contato(s) com mensagens pendentes, ` +
+                `${this.profilePictureCache.size} foto(s) em cache`,
+            );
+          }
+        } catch (error) {
+          this.logger.error(`Erro na limpeza periódica de sessões: ${error?.message || String(error)}`);
+        }
+      },
+      10 * 60 * 1000,
+    ); // 10 minutos
+  }
+
+  /**
    * Tenta recuperar sessão de criptografia com contato problemático
    * @param jid - JID do contato com erro de PreKey
    */
@@ -5768,10 +5956,34 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.warn(`Detectados ${errorInfo.count} erros de PreKey para ${jid}. Tentando reestabelecer sessão...`);
 
         try {
-          // Força reestabelecimento da sessão
+          // Estratégia 1: Tenta limpar a sessão existente antes de reestabelecer
+          try {
+            const signalRepository = this.client.signalRepository;
+            if (signalRepository && typeof signalRepository.jidToSignalProtocolAddress === 'function') {
+              const address = signalRepository.jidToSignalProtocolAddress(jid);
+
+              // Tenta deletar a sessão corrompida
+              if (
+                (signalRepository as any).sessionStore &&
+                typeof (signalRepository as any).sessionStore.deleteSession === 'function'
+              ) {
+                await (signalRepository as any).sessionStore.deleteSession(address);
+                this.logger.info(`Sessão corrompida deletada para ${jid}`);
+              }
+            }
+          } catch (cleanupError) {
+            this.logger.verbose(
+              `Não foi possível limpar sessão antiga: ${cleanupError?.message || String(cleanupError)}`,
+            );
+          }
+
+          // Estratégia 2: Força reestabelecimento da sessão
           await this.client.assertSessions([jid], true);
 
           this.logger.info(`Sessão reestabelecida com sucesso para ${jid}`);
+
+          // Aguarda um pouco para garantir que a sessão foi estabelecida
+          await new Promise((resolve) => setTimeout(resolve, 1000));
 
           // Tenta reprocessar mensagens armazenadas
           const recoveredCount = await this.retryFailedMessages(jid);
@@ -5785,13 +5997,13 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (assertError) {
           this.logger.error(`Falha ao reestabelecer sessão com ${jid}: ${assertError?.message || String(assertError)}`);
 
-          // Se falhar 3 vezes, descarta mensagens e reseta contador
-          if (errorInfo.count >= 3) {
+          // Se falhar 5 vezes (aumentado de 3), descarta mensagens e reseta contador
+          if (errorInfo.count >= 5) {
             // Notifica sobre mensagens perdidas
             const lostMessages = this.failedMessages.get(jid);
             if (lostMessages && lostMessages.length > 0) {
               this.logger.error(
-                `ATENÇÃO: ${lostMessages.length} mensagem(ns) de ${jid} não puderam ser recuperadas após 3 tentativas e serão descartadas.`,
+                `ATENÇÃO: ${lostMessages.length} mensagem(ns) de ${jid} não puderam ser recuperadas após ${errorInfo.count} tentativas e serão descartadas.`,
               );
               this.failedMessages.delete(jid);
             }
@@ -5814,9 +6026,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysSignalRepositoryDecryptMessage(jid: string, type: 'pkmsg' | 'msg', ciphertext: string) {
-    try {
-      const ciphertextBuffer = Buffer.from(ciphertext, 'base64');
+    const ciphertextBuffer = Buffer.from(ciphertext, 'base64');
 
+    try {
       const response = await this.client.signalRepository.decryptMessage({
         jid,
         type,
@@ -5831,13 +6043,58 @@ export class BaileysStartupService extends ChannelStartupService {
       return response instanceof Uint8Array ? Buffer.from(response).toString('base64') : response;
     } catch (error) {
       const errorMsg = error?.message || String(error);
+      const errorName = error?.name || '';
 
       // Log detalhado para erros de PreKey
-      if (errorMsg.includes('PreKey') || errorMsg.includes('SessionError')) {
-        this.logger.error(`Erro de descriptografia (${type}) para ${jid}: ${errorMsg.substring(0, 200)}`);
+      if (errorMsg.includes('PreKey') || errorMsg.includes('SessionError') || errorName === 'PreKeyError') {
+        this.logger.error(
+          `Erro de descriptografia (${type}) para ${jid}: ${errorMsg.substring(0, 200)} [${errorName}]`,
+        );
 
-        // Tenta recuperar a sessão automaticamente
-        await this.attemptSessionRecovery(jid);
+        // Para erros de PreKey, tenta recuperação imediata se for a primeira vez
+        const errorInfo = this.preKeyErrorTracker.get(jid);
+        if (!errorInfo || errorInfo.count === 0) {
+          this.logger.warn(`Primeira ocorrência de PreKeyError para ${jid}, tentando recuperação imediata...`);
+
+          try {
+            // Tenta limpar e reestabelecer a sessão imediatamente
+            const signalRepository = this.client.signalRepository;
+            if (signalRepository && typeof signalRepository.jidToSignalProtocolAddress === 'function') {
+              const address = signalRepository.jidToSignalProtocolAddress(jid);
+
+              if (
+                (signalRepository as any).sessionStore &&
+                typeof (signalRepository as any).sessionStore.deleteSession === 'function'
+              ) {
+                await (signalRepository as any).sessionStore.deleteSession(address);
+                this.logger.verbose(`Sessão corrompida deletada para ${jid}`);
+              }
+            }
+
+            // Reestabelece a sessão
+            await this.client.assertSessions([jid], true);
+            this.logger.info(`Sessão reestabelecida imediatamente para ${jid}`);
+
+            // Tenta descriptografar novamente
+            const retryResponse = await this.client.signalRepository.decryptMessage({
+              jid,
+              type,
+              ciphertext: ciphertextBuffer,
+            });
+
+            this.logger.info(`✅ Mensagem descriptografada com sucesso após recuperação imediata para ${jid}`);
+            return retryResponse instanceof Uint8Array ? Buffer.from(retryResponse).toString('base64') : retryResponse;
+          } catch (retryError) {
+            this.logger.warn(
+              `Recuperação imediata falhou, usando fluxo normal: ${retryError?.message || String(retryError)}`,
+            );
+            // Continua com o fluxo normal de recuperação
+            await this.attemptSessionRecovery(jid);
+          }
+        } else {
+          // Tenta recuperar a sessão automaticamente (fluxo normal)
+          await this.attemptSessionRecovery(jid);
+        }
       } else {
         this.logger.error('Error decrypting message:');
         this.logger.error(error);

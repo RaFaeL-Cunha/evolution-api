@@ -242,8 +242,8 @@ class ChatwootImport {
 
       const chatwootUser = await this.getChatwootUser(provider);
       if (!chatwootUser) {
-        this.logger.error('❌ Usuário Chatwoot não encontrado para importação');
-        throw new Error('User not found to import messages.');
+        this.logger.error('Usuario Chatwoot nao encontrado para importacao');
+        throw new Error('Usuario nao encontrado para importar mensagens');
       }
 
       let totalMessagesImported = 0;
@@ -665,6 +665,18 @@ class ChatwootImport {
     const contentMessage = chatwootService.getConversationMessage(msg.message, msg);
     if (contentMessage) {
       return contentMessage;
+    }
+
+    // 🔍 DEBUG: Log para ver por que getConversationMessage retornou null
+    if (!contentMessage) {
+      this.logger.verbose(
+        `⚠️ getConversationMessage retornou null para mensagem:\n` +
+          `  - ID: ${msg.key?.id}\n` +
+          `  - RemoteJid: ${msg.key?.remoteJid}\n` +
+          `  - FromMe: ${msg.key?.fromMe}\n` +
+          `  - MessageType: ${Object.keys(msg.message || {}).join(', ')}\n` +
+          `  - Message keys: ${JSON.stringify(Object.keys(msg.message || {}))}`,
+      );
     }
 
     if (!configService.get<Chatwoot>('CHATWOOT').IMPORT.PLACEHOLDER_MEDIA_MESSAGE) {
