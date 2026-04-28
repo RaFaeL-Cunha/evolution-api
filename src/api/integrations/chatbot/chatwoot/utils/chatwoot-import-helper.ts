@@ -667,18 +667,6 @@ class ChatwootImport {
       return contentMessage;
     }
 
-    // 🔍 DEBUG: Log para ver por que getConversationMessage retornou null
-    if (!contentMessage) {
-      this.logger.verbose(
-        `⚠️ getConversationMessage retornou null para mensagem:\n` +
-          `  - ID: ${msg.key?.id}\n` +
-          `  - RemoteJid: ${msg.key?.remoteJid}\n` +
-          `  - FromMe: ${msg.key?.fromMe}\n` +
-          `  - MessageType: ${Object.keys(msg.message || {}).join(', ')}\n` +
-          `  - Message keys: ${JSON.stringify(Object.keys(msg.message || {}))}`,
-      );
-    }
-
     if (!configService.get<Chatwoot>('CHATWOOT').IMPORT.PLACEHOLDER_MEDIA_MESSAGE) {
       return '';
     }

@@ -1630,7 +1630,6 @@ export class ChatwootService {
   }
 
   public async receiveWebhook(instance: InstanceDto, body: any) {
-    // 🔍 DEBUG: Log de TODOS os webhooks recebidos
     if (body.event === 'message_updated' && body.content_attributes?.deleted) {
       this.logger.log(
         `🔔 WEBHOOK DELETE RECEBIDO:\n` +
@@ -1688,7 +1687,7 @@ export class ChatwootService {
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
         this.logger.verbose(`🗑️ Tentando deletar mensagem - Chatwoot ID: ${body.id}`);
 
-        // 🔍 Tenta buscar pelo chatwootMessageId primeiro
+        // Tenta buscar pelo chatwootMessageId primeiro
         let message = await this.prismaRepository.message.findFirst({
           where: {
             chatwootMessageId: body.id,
@@ -1696,7 +1695,7 @@ export class ChatwootService {
           },
         });
 
-        // 🔍 Se não encontrou e tem source_id, tenta buscar por ele
+        // Se nao encontrou e tem source_id, tenta buscar por ele
         if (!message && body.source_id) {
           const whatsappId = body.source_id.replace('WAID:', '');
           this.logger.verbose(`Tentando buscar por source_id: ${whatsappId}`);
@@ -3473,7 +3472,6 @@ export class ChatwootService {
 
       this.logger.error(`❌ Erro ao processar evento ${event} (messageId: ${messageId}): ${errorMsg}`);
 
-      // Log adicional para debug
       if (error?.response?.data) {
         this.logger.error(`Resposta da API Chatwoot: ${JSON.stringify(error.response.data)}`);
       }
