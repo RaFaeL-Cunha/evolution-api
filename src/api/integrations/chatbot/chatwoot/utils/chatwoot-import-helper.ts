@@ -608,9 +608,14 @@ class ChatwootImport {
         phoneNumber = key.remoteJid.split('@')[0];
         this.logger.verbose(`✅ LID no remoteJidAlt, usando remoteJid: ${key.remoteJidAlt} → ${key.remoteJid}`);
       }
-      // Cenario 3: LID no remoteJid, sem remoteJidAlt (busca no cache)
-      else if (isLidInRemoteJid && prismaRepository) {
-        // Busca no cache IsOnWhatsapp
+      // Cenario 3: LID no remoteJid, sem remoteJidAlt - tenta buscar no cache IsOnWhatsapp
+      else if (isLidInRemoteJid && !key.remoteJidAlt) {
+        if (!prismaRepository) {
+          this.logger.warn(`⚠️ LID sem remoteJidAlt e sem cache disponivel: ${key.remoteJid} - pulando`);
+          continue;
+        }
+
+        // Busca no cache IsOnWhatsapp para encontrar o JID real
         try {
           const cached = await prismaRepository.isOnWhatsapp.findFirst({
             where: {
@@ -620,22 +625,15 @@ class ChatwootImport {
 
           if (cached?.remoteJid && !cached.remoteJid.includes('@lid')) {
             phoneNumber = cached.remoteJid.split('@')[0];
-            this.logger.verbose(`✅ LID convertido usando cache: ${key.remoteJid} → ${cached.remoteJid}`);
+            this.logger.verbose(`✅ LID convertido via cache IsOnWhatsapp: ${key.remoteJid} → ${cached.remoteJid}`);
           } else {
-            this.logger.verbose(`⚠️ LID sem conversao disponivel: ${key.remoteJid} - pulando importacao`);
+            this.logger.warn(`⚠️ LID nao encontrado no cache IsOnWhatsapp: ${key.remoteJid} - pulando`);
             continue;
           }
-        } catch {
-          this.logger.verbose(`⚠️ Erro ao buscar LID no cache: ${key.remoteJid} - pulando importacao`);
+        } catch (error) {
+          this.logger.warn(`⚠️ Erro ao buscar LID no cache: ${key.remoteJid} - ${error.message} - pulando`);
           continue;
         }
-      }
-      // Cenario 4: LID no remoteJid, sem cache disponivel
-      else if (isLidInRemoteJid) {
-        this.logger.verbose(
-          `⚠️ Mensagem com LID detectada: ${key.remoteJid} - pulando importacao (sem acesso ao cache)`,
-        );
-        continue;
       }
 
       if (phoneNumber) {

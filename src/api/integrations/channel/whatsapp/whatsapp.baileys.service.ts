@@ -1913,7 +1913,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-              const { remoteJidAlt, ...contactData } = contactRaw;
+              const { ...contactData } = contactRaw;
               await this.prismaRepository.contact.upsert({
                 where: {
                   remoteJid_instanceId: {
@@ -1932,7 +1932,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-            const { remoteJidAlt, ...contactData } = contactRaw;
+            const { ...contactData } = contactRaw;
             await this.prismaRepository.contact.upsert({
               where: {
                 remoteJid_instanceId: {

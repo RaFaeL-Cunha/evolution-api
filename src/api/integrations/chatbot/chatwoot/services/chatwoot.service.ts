@@ -846,11 +846,26 @@ export class ChatwootService {
         phoneNumber = remoteJid;
         this.logger.verbose(`Cenario 2: LID no remoteJidAlt, usando remoteJid: ${phoneNumber}`);
       }
-      // Cenario 3: LID no remoteJid, sem remoteJidAlt (fallback)
+      // Cenario 3: LID no remoteJid, sem remoteJidAlt (busca no cache IsOnWhatsapp)
       else if (isLidInRemoteJid && !body.key.remoteJidAlt) {
-        const lidNumber = remoteJid.split('@')[0].split(':')[0];
-        phoneNumber = `${lidNumber}@s.whatsapp.net`;
-        this.logger.warn(`Cenario 3: LID sem remoteJidAlt, usando fallback: ${phoneNumber}`);
+        try {
+          const cached = await this.prismaRepository.isOnWhatsapp.findFirst({
+            where: {
+              OR: [{ jidOptions: { contains: remoteJid } }, { remoteJid: remoteJid }],
+            },
+          });
+
+          if (cached?.remoteJid && !cached.remoteJid.includes('@lid')) {
+            phoneNumber = cached.remoteJid;
+            this.logger.verbose(`Cenario 3: LID convertido via cache IsOnWhatsapp: ${remoteJid} → ${phoneNumber}`);
+          } else {
+            this.logger.warn(`Cenario 3: LID nao encontrado no cache IsOnWhatsapp: ${remoteJid}`);
+            phoneNumber = null;
+          }
+        } catch (error) {
+          this.logger.error(`Cenario 3: Erro ao buscar LID no cache: ${remoteJid} - ${error.message}`);
+          phoneNumber = null;
+        }
       }
       // Cenario 4: Nenhum LID, usa remoteJid normal
       else {
