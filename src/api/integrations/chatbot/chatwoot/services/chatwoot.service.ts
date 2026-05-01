@@ -2480,6 +2480,14 @@ export class ChatwootService {
 
     let result = typeKey ? types[typeKey] : undefined;
 
+    // 🔍 DEBUG: Log quando não encontra typeKey
+    if (!typeKey) {
+      this.logger.warn(
+        `⚠️ getMessageContent: Nenhum typeKey encontrado - Types: ${JSON.stringify(Object.keys(types))}`,
+      );
+      return undefined;
+    }
+
     // Remove externalAdReplyBody| in Chatwoot (Already Have)
     if (result && typeof result === 'string' && result.includes('externalAdReplyBody|')) {
       result = result.split('externalAdReplyBody|').filter(Boolean).join('');
@@ -2701,6 +2709,13 @@ export class ChatwootService {
         '_ID_: ' +
         responseRowId;
       return formattedResponseList;
+    }
+
+    // 🔍 DEBUG: Log quando retorna result sem tratamento específico
+    if (!result || (typeof result === 'string' && result.trim() === '')) {
+      this.logger.warn(
+        `⚠️ getMessageContent: Retornando result vazio/undefined - typeKey: ${typeKey}, result: ${JSON.stringify(result)}`,
+      );
     }
 
     return result;

@@ -362,6 +362,11 @@ class ChatwootImport {
               const contentMessage = this.getContentMessage(chatwootService, message);
               if (!contentMessage) {
                 skippedNoContent++;
+                // 🔍 DEBUG: Log do tipo de mensagem que não tem conteúdo
+                const messageTypes = Object.keys(message.message || {});
+                this.logger.warn(
+                  `⚠️ Mensagem sem conteúdo - Tipos: ${messageTypes.join(', ')} - Key: ${message.key?.id}`,
+                );
                 return;
               }
 
