@@ -2615,8 +2615,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const onWhatsapp = (await this.whatsappNumber({ numbers: [jid] }))?.shift();
 
+    if (!onWhatsapp) {
+      throw new BadRequestException('Numero nao encontrado no WhatsApp');
+    }
+
     if (!onWhatsapp.exists) {
-      throw new BadRequestException(onWhatsapp);
+      throw new BadRequestException('Numero nao esta registrado no WhatsApp');
     }
 
     try {
