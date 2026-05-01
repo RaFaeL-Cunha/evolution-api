@@ -3692,12 +3692,26 @@ export class ChatwootService {
           Instance: { name: instance.instanceName },
           messageTimestamp: { gte: Number(dayjs().subtract(10, 'hours').unix()) },
           AND: ids.map((id) => ({ key: { path: ['id'], not: id } })),
+          // Ignora mensagens marcadas como "falha permanente" (chatwootMessageId = -1)
+          NOT: {
+            chatwootMessageId: -1,
+          },
         },
       });
 
-      const filteredMessages = savedMessages.filter(
-        (msg: any) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid),
-      );
+      const filteredMessages = savedMessages.filter((msg: any) => {
+        // Ignora números especiais (grupos, status, etc)
+        if (chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)) {
+          return false;
+        }
+
+        // Ignora mensagens de álbum (metadados) - as mídias reais já são importadas via imageMessage/videoMessage
+        if (msg.message?.albumMessage || msg.message?.associatedChildMessage) {
+          return false;
+        }
+
+        return true;
+      });
 
       this.logger.log(`[syncLostMessages] Mensagens encontradas no banco: ${savedMessages.length}`);
       this.logger.log(`[syncLostMessages] Mensagens após filtro: ${filteredMessages.length}`);
@@ -3740,6 +3754,41 @@ export class ChatwootService {
       waInstance.clearCacheChatwoot();
 
       this.logger.log(`[syncLostMessages] Sincronização concluída: ${totalImported} mensagens importadas`);
+
+      // 🔧 Marca mensagens que falharam após 3 tentativas como "ignoradas permanentemente"
+      if (totalImported === 0 && messagesRaw.length > 0) {
+        this.logger.warn(
+          `[syncLostMessages] ⚠️ ATENÇÃO: ${messagesRaw.length} mensagens foram encontradas mas 0 foram importadas.`,
+        );
+
+        // Incrementa contador de tentativas e marca como ignorada se >= 3
+        for (const msg of filteredMessages) {
+          const messageId = msg.key?.id;
+          if (!messageId) continue;
+
+          // Busca tentativas atuais (usa chatwootRetries ou 0)
+          const currentRetries = (msg as any).chatwootRetries || 0;
+          const newRetries = currentRetries + 1;
+
+          if (newRetries >= 3) {
+            // Marca como "falha permanente" (chatwootMessageId = -1)
+            await this.prismaRepository.message.update({
+              where: { id: msg.id },
+              data: { chatwootMessageId: -1 },
+            });
+            this.logger.warn(
+              `[syncLostMessages] ❌ Mensagem ${messageId} marcada como falha permanente após 3 tentativas`,
+            );
+          } else {
+            // Incrementa contador de tentativas (usa campo chatwootRetries se existir)
+            await this.prismaRepository.message.update({
+              where: { id: msg.id },
+              data: { chatwootRetries: newRetries } as any,
+            });
+            this.logger.log(`[syncLostMessages] 🔄 Mensagem ${messageId} - tentativa ${newRetries}/3`);
+          }
+        }
+      }
 
       // 🔧 Se retornou 0, pode ser erro silencioso ou realmente não tinha mensagens
       if (totalImported === 0 && messagesRaw.length > 0) {
