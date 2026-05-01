@@ -2493,16 +2493,12 @@ export class ChatwootService {
     }
 
     if (typeKey === 'secretEncryptedMessage') {
-      return '🔐 *Mensagem criptografada*\n\n_Esta mensagem não pôde ser descriptografada. Pode ser uma mensagem de outro dispositivo ou sessão._';
+      return '🔐 *Mensagem criptografada*\n\n_Esta mensagem não pôde ser descriptografada. Verifique no celular para visualizar._';
     }
 
-    if (typeKey === 'albumMessage') {
-      const albumCount = result?.childMessages?.length || result?.messages?.length || 0;
-      return `📸 *Álbum de mídia*\n\n_${albumCount > 0 ? `${albumCount} itens enviados juntos` : 'Múltiplas mídias enviadas juntas'}_`;
-    }
-
-    if (typeKey === 'associatedChildMessage') {
-      return '📎 *Mídia de álbum*\n\n_Esta mídia faz parte de um álbum (múltiplas fotos/vídeos enviados juntos)_';
+    if (typeKey === 'albumMessage' || typeKey === 'associatedChildMessage') {
+      // Ignora mensagens de álbum (metadados) - as mídias reais já são importadas via imageMessage/videoMessage
+      return null;
     }
 
     if (typeKey === 'pollCreationMessageV3') {
