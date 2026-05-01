@@ -2470,6 +2470,9 @@ export class ChatwootService {
         msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.audioMessage?.url,
+      secretEncryptedMessage: msg.secretEncryptedMessage,
+      albumMessage: msg.albumMessage,
+      associatedChildMessage: msg.associatedChildMessage,
     };
 
     return types;
@@ -2480,14 +2483,6 @@ export class ChatwootService {
 
     let result = typeKey ? types[typeKey] : undefined;
 
-    // 🔍 DEBUG: Log quando não encontra typeKey
-    if (!typeKey) {
-      this.logger.warn(
-        `⚠️ getMessageContent: Nenhum typeKey encontrado - Types: ${JSON.stringify(Object.keys(types))}`,
-      );
-      return undefined;
-    }
-
     // Remove externalAdReplyBody| in Chatwoot (Already Have)
     if (result && typeof result === 'string' && result.includes('externalAdReplyBody|')) {
       result = result.split('externalAdReplyBody|').filter(Boolean).join('');
@@ -2495,6 +2490,19 @@ export class ChatwootService {
 
     if (typeKey === 'viewOnceMessageV2') {
       return '🔒 *Mensagem de visualização única*\n\n_Esta mensagem só pode ser visualizada uma vez no celular. Por segurança, o WhatsApp não permite que ela seja acessada pela API._';
+    }
+
+    if (typeKey === 'secretEncryptedMessage') {
+      return '🔐 *Mensagem criptografada*\n\n_Esta mensagem não pôde ser descriptografada. Pode ser uma mensagem de outro dispositivo ou sessão._';
+    }
+
+    if (typeKey === 'albumMessage') {
+      const albumCount = result?.childMessages?.length || result?.messages?.length || 0;
+      return `📸 *Álbum de mídia*\n\n_${albumCount > 0 ? `${albumCount} itens enviados juntos` : 'Múltiplas mídias enviadas juntas'}_`;
+    }
+
+    if (typeKey === 'associatedChildMessage') {
+      return '📎 *Mídia de álbum*\n\n_Esta mídia faz parte de um álbum (múltiplas fotos/vídeos enviados juntos)_';
     }
 
     if (typeKey === 'pollCreationMessageV3') {
@@ -2709,13 +2717,6 @@ export class ChatwootService {
         '_ID_: ' +
         responseRowId;
       return formattedResponseList;
-    }
-
-    // 🔍 DEBUG: Log quando retorna result sem tratamento específico
-    if (!result || (typeof result === 'string' && result.trim() === '')) {
-      this.logger.warn(
-        `⚠️ getMessageContent: Retornando result vazio/undefined - typeKey: ${typeKey}, result: ${JSON.stringify(result)}`,
-      );
     }
 
     return result;
