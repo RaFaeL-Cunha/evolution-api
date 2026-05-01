@@ -2479,7 +2479,8 @@ export class ChatwootService {
   }
 
   private getMessageContent(types: any) {
-    const typeKey = Object.keys(types).find((key) => types[key] !== undefined);
+    // Ignora messageContextInfo pois é apenas metadado - busca o tipo real da mensagem
+    const typeKey = Object.keys(types).find((key) => key !== 'messageContextInfo' && types[key] !== undefined);
 
     let result = typeKey ? types[typeKey] : undefined;
 
@@ -2713,6 +2714,13 @@ export class ChatwootService {
         '_ID_: ' +
         responseRowId;
       return formattedResponseList;
+    }
+
+    // Log de warning se nenhum tipo foi encontrado (para debug)
+    if (!typeKey) {
+      this.logger.warn(
+        `⚠️ getMessageContent: Nenhum tipo de mensagem encontrado - Types: ${JSON.stringify(Object.keys(types))}`,
+      );
     }
 
     return result;
