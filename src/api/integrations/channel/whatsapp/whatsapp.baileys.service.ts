@@ -269,6 +269,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  // 🔧 PR #2510: Contadores de history sync para emitir MESSAGING_HISTORY_SET
+  private historySyncMessageCount = 0;
+  private historySyncChatCount = 0;
+  private historySyncContactCount = 0;
+  private historySyncLastProgress = 0;
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -1002,6 +1008,16 @@ export class BaileysStartupService extends ChannelStartupService {
       syncType?: proto.HistorySync.HistorySyncType;
     }) => {
       try {
+        // 🔧 PR #2510: Reset contadores se progress reiniciar ou diminuir
+        if (progress !== undefined && (progress < this.historySyncLastProgress || progress === 0)) {
+          this.logger.verbose(
+            `🔄 History sync reset detected (progress: ${progress}% < ${this.historySyncLastProgress}%)`,
+          );
+          this.historySyncMessageCount = 0;
+          this.historySyncChatCount = 0;
+          this.historySyncContactCount = 0;
+        }
+        this.historySyncLastProgress = progress ?? 0;
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
           console.log('received on-demand history sync, messages=', messages);
         }
@@ -1073,6 +1089,9 @@ export class BaileysStartupService extends ChannelStartupService {
           });
         }
 
+        // 🔧 PR #2510: Incrementa contador de chats
+        this.historySyncChatCount += chatsRaw.length;
+
         const messagesRaw: any[] = [];
 
         const messagesRepository: Set<string> = new Set(
@@ -1136,6 +1155,9 @@ export class BaileysStartupService extends ChannelStartupService {
           });
         }
 
+        // 🔧 PR #2510: Incrementa contador de mensagens
+        this.historySyncMessageCount += messagesRaw.length;
+
         if (
           this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
           this.localChatwoot?.enabled &&
@@ -1148,8 +1170,31 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
+        // 🔧 PR #2510: Filtra e conta contatos antes de upsert
+        const filteredContacts = contacts.filter((c) => !!c.notify || !!c.name);
+        this.historySyncContactCount += filteredContacts.length;
+
+        // 🔧 PR #2510: Emite MESSAGING_HISTORY_SET quando sync completa (progress = 100)
+        if (progress === 100) {
+          this.logger.log(
+            `✅ History sync completed: ${this.historySyncMessageCount} messages, ${this.historySyncChatCount} chats, ${this.historySyncContactCount} contacts`,
+          );
+
+          this.sendDataWebhook(Events.MESSAGING_HISTORY_SET, {
+            messageCount: this.historySyncMessageCount,
+            chatCount: this.historySyncChatCount,
+            contactCount: this.historySyncContactCount,
+          });
+
+          // Reset contadores após emitir evento
+          this.historySyncMessageCount = 0;
+          this.historySyncChatCount = 0;
+          this.historySyncContactCount = 0;
+          this.historySyncLastProgress = 0;
+        }
+
         await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          filteredContacts.map((c) => ({ id: c.id, name: c.name ?? c.notify })),
         );
 
         contacts = undefined;
