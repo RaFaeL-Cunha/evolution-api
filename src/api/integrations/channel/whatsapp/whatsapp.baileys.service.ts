@@ -273,7 +273,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private historySyncMessageCount = 0;
   private historySyncChatCount = 0;
   private historySyncContactCount = 0;
-  private historySyncLastProgress = 0;
+  private historySyncLastProgress = -1;
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -1008,16 +1008,17 @@ export class BaileysStartupService extends ChannelStartupService {
       syncType?: proto.HistorySync.HistorySyncType;
     }) => {
       try {
+        // 🔧 PR #2510: Normaliza progress (undefined vira -1)
+        const normalizedProgress = progress ?? -1;
+
         // 🔧 PR #2510: Reset contadores se progress reiniciar ou diminuir
-        if (progress !== undefined && (progress < this.historySyncLastProgress || progress === 0)) {
-          this.logger.verbose(
-            `🔄 History sync reset detected (progress: ${progress}% < ${this.historySyncLastProgress}%)`,
-          );
+        if (normalizedProgress <= this.historySyncLastProgress) {
           this.historySyncMessageCount = 0;
           this.historySyncChatCount = 0;
           this.historySyncContactCount = 0;
         }
-        this.historySyncLastProgress = progress ?? 0;
+        this.historySyncLastProgress = normalizedProgress;
+
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
           console.log('received on-demand history sync, messages=', messages);
         }
@@ -1175,24 +1176,23 @@ export class BaileysStartupService extends ChannelStartupService {
         this.historySyncContactCount += filteredContacts.length;
 
         // 🔧 PR #2510: Emite MESSAGING_HISTORY_SET quando sync completa (progress = 100)
-        if (progress === 100) {
-          this.logger.log(
-            `✅ History sync completed: ${this.historySyncMessageCount} messages, ${this.historySyncChatCount} chats, ${this.historySyncContactCount} contacts`,
-          );
-
+        // IMPORTANTE: Emite ANTES de contacts.upsert para garantir ordem correta
+        if (normalizedProgress === 100) {
           this.sendDataWebhook(Events.MESSAGING_HISTORY_SET, {
             messageCount: this.historySyncMessageCount,
             chatCount: this.historySyncChatCount,
             contactCount: this.historySyncContactCount,
+            progress: normalizedProgress,
           });
 
           // Reset contadores após emitir evento
           this.historySyncMessageCount = 0;
           this.historySyncChatCount = 0;
           this.historySyncContactCount = 0;
-          this.historySyncLastProgress = 0;
+          this.historySyncLastProgress = -1;
         }
 
+        // 🔧 PR #2510: contacts.upsert DEPOIS de emitir evento
         await this.contactHandle['contacts.upsert'](
           filteredContacts.map((c) => ({ id: c.id, name: c.name ?? c.notify })),
         );
