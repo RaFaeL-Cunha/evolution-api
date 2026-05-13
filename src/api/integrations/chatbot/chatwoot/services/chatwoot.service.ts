@@ -1844,9 +1844,6 @@ export class ChatwootService {
           try {
             const chatwootConfig = await waInstance.findChatwoot();
 
-            // 🔧 Seta o provider no contexto ANTES de enviar mensagens
-            this.provider = chatwootConfig;
-
             await this.createBotMessage(
               instance,
               '🔄 Sincronizando mensagens perdidas das últimas 10 horas...',
@@ -2870,6 +2867,10 @@ export class ChatwootService {
         this.logger.warn('wa instance not found');
         return null;
       }
+
+      // 🔧 Seta o provider no contexto ANTES de qualquer operação
+      // Isso garante que createBotMessage funcione em TODOS os eventos (qrcode, commands, etc)
+      this.provider = await waInstance.findChatwoot();
 
       const client = await this.clientCw(instance);
 
