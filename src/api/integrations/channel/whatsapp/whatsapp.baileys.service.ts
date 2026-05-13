@@ -99,7 +99,6 @@ import makeWASocket, {
   Chat,
   ConnectionState,
   Contact,
-  decryptPollVote,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
@@ -114,7 +113,6 @@ import makeWASocket, {
   isJidGroup,
   isJidNewsletter,
   isPnUser,
-  jidNormalizedUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   MessageUserReceiptUpdate,
@@ -135,10 +133,7 @@ import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
-import { profile } from 'console';
-import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
-import { query } from 'express';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
 import Long from 'long';
@@ -150,7 +145,6 @@ import { join } from 'path';
 import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
-import { buffer, timestamp } from 'rxjs';
 import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';

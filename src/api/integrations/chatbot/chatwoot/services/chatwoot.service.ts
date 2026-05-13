@@ -1578,6 +1578,9 @@ export class ChatwootService {
           break;
       }
 
+      // 🔧 Extrai contextInfo se existir (para mensagens encaminhadas)
+      const contextInfo = (options as any)?.contextInfo;
+
       if (type === 'audio') {
         const data: SendAudioDto = {
           number: number,
@@ -1588,7 +1591,7 @@ export class ChatwootService {
 
         sendTelemetry('/message/sendWhatsAppAudio');
 
-        const messageSent = await waInstance?.audioWhatsapp(data, null, true);
+        const messageSent = await waInstance?.audioWhatsapp(data, contextInfo, true);
 
         return messageSent;
       }
@@ -1613,7 +1616,7 @@ export class ChatwootService {
         data.caption = caption;
       }
 
-      const messageSent = await waInstance?.mediaMessage(data, null, true);
+      const messageSent = await waInstance?.mediaMessage(data, contextInfo, true);
 
       return messageSent;
     } catch (error) {
@@ -2021,9 +2024,43 @@ export class ChatwootService {
                 formatText = null;
               }
 
+              // 🔧 FIX: Detecta se é anexo encaminhado e remove o indicador de texto
+              let isForwardedAttachment = false;
+              let forwardCountAttachment = 1;
+
+              if (formatText && formatText.includes('↪️ _Encaminhada')) {
+                isForwardedAttachment = true;
+
+                // Detecta se tem contador (ex: "↪️ _Encaminhada 5x_")
+                const forwardMatch = formatText.match(/↪️ _Encaminhada (\d+)x_/);
+                if (forwardMatch) {
+                  forwardCountAttachment = parseInt(forwardMatch[1], 10);
+                  formatText = formatText.replace(/↪️ _Encaminhada \d+x_\n\n/, '').trim();
+                } else {
+                  formatText = formatText.replace(/↪️ _Encaminhada_\n\n/, '').trim();
+                }
+
+                // Se ficou vazio após remover, deixa null
+                if (formatText === '') {
+                  formatText = null;
+                }
+
+                this.logger.verbose(
+                  `✅ Anexo encaminhado detectado - Removendo indicador de texto e usando flag nativa (count: ${forwardCountAttachment})`,
+                );
+              }
+
               const options: Options = {
                 quoted: await this.getQuotedMessage(body, instance),
               };
+
+              // Adiciona flag de encaminhamento se necessário (cast para any pois Options não tem contextInfo no tipo)
+              if (isForwardedAttachment) {
+                (options as any).contextInfo = {
+                  isForwarded: true,
+                  forwardingScore: forwardCountAttachment,
+                };
+              }
 
               let messageSent: any;
               try {
@@ -2098,6 +2135,28 @@ export class ChatwootService {
               return { message: 'bot' };
             }
 
+            // 🔧 FIX: Detecta se é mensagem encaminhada e usa flag nativa do WhatsApp
+            let isForwardedMessage = false;
+            let forwardCount = 1;
+
+            // Remove o indicador "↪️ Encaminhada" do texto (será substituído pela flag nativa)
+            if (formatText.includes('↪️ _Encaminhada')) {
+              isForwardedMessage = true;
+
+              // Detecta se tem contador (ex: "↪️ _Encaminhada 5x_")
+              const forwardMatch = formatText.match(/↪️ _Encaminhada (\d+)x_/);
+              if (forwardMatch) {
+                forwardCount = parseInt(forwardMatch[1], 10);
+                formatText = formatText.replace(/↪️ _Encaminhada \d+x_\n\n/, '').trim();
+              } else {
+                formatText = formatText.replace(/↪️ _Encaminhada_\n\n/, '').trim();
+              }
+
+              this.logger.verbose(
+                `✅ Mensagem encaminhada detectada - Removendo indicador de texto e usando flag nativa (count: ${forwardCount})`,
+              );
+            }
+
             const data: SendTextDto = {
               number: chatId,
               text: formatText,
@@ -2112,11 +2171,27 @@ export class ChatwootService {
               // Retry automatico: 4 tentativas (~25 segundos total)
               messageSent = await retryWithBackoff(
                 async () => {
-                  const result = await waInstance?.textMessage(data, true);
-                  if (!result) {
-                    throw new Error('Mensagem nao foi enviada');
+                  // 🔧 Se é mensagem encaminhada, adiciona flag nativa do WhatsApp
+                  if (isForwardedMessage) {
+                    const result = await waInstance?.client?.sendMessage(chatId, {
+                      text: formatText,
+                      contextInfo: {
+                        isForwarded: true,
+                        forwardingScore: forwardCount,
+                      },
+                    });
+                    if (!result) {
+                      throw new Error('Mensagem nao foi enviada');
+                    }
+                    return result;
+                  } else {
+                    // Mensagem normal
+                    const result = await waInstance?.textMessage(data, true);
+                    if (!result) {
+                      throw new Error('Mensagem nao foi enviada');
+                    }
+                    return result;
                   }
-                  return result;
                 },
                 4,
                 `Enviar mensagem para ${chatId}`,
@@ -2748,7 +2823,9 @@ export class ChatwootService {
       const forwardCount = forwardingScore || 1;
       const forwardIndicator = forwardCount > 1 ? `↪️ _Encaminhada ${forwardCount}x_\n\n` : `↪️ _Encaminhada_\n\n`;
 
-      this.logger.log(`✅ Mensagem encaminhada detectada (score: ${forwardCount})`);
+      this.logger.verbose(
+        `✅ Mensagem encaminhada detectada - Score: ${forwardingScore} | Count: ${forwardCount} | Indicador: "${forwardIndicator.trim()}"`,
+      );
 
       // 🔧 FIX: Só adiciona indicador se messageContent existir (evita "undefined" em mídias sem caption)
       if (messageContent) {
