@@ -1952,7 +1952,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-              const { ...contactData } = contactRaw;
+              // eslint-disable-next-line @typescript-eslint/no-unused-vars
+              const { remoteJidAlt, ...contactData } = contactRaw;
               await this.prismaRepository.contact.upsert({
                 where: {
                   remoteJid_instanceId: {
@@ -1971,7 +1972,8 @@ export class BaileysStartupService extends ChannelStartupService {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-            const { ...contactData } = contactRaw;
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { remoteJidAlt, ...contactData } = contactRaw;
             await this.prismaRepository.contact.upsert({
               where: {
                 remoteJid_instanceId: {
