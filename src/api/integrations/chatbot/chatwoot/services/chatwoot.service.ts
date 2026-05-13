@@ -3760,12 +3760,14 @@ export class ChatwootService {
         return 0;
       }
 
-      // 🔧 Valida provider antes de continuar
-      const provider = await this.clientCw(instance);
-      if (!provider) {
-        this.logger.error(`[syncLostMessages] Provider not found for ${instance.instanceName}`);
+      // 🔧 Usa o chatwootConfig que já foi passado como parâmetro
+      if (!chatwootConfig) {
+        this.logger.error(`[syncLostMessages] chatwootConfig not provided for ${instance.instanceName}`);
         throw new Error('Configuração do SoConnect não encontrada. Verifique a integração.');
       }
+
+      // 🔧 Seta o provider no contexto para que getInbox funcione
+      this.provider = chatwootConfig;
 
       const inbox = await this.getInbox(instance);
       if (!inbox) {
