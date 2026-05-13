@@ -1841,14 +1841,18 @@ export class ChatwootService {
         }
 
         if (command === 'sync' || command === 'lost') {
-          await this.createBotMessage(
-            instance,
-            '🔄 Sincronizando mensagens perdidas das últimas 10 horas...',
-            'incoming',
-          );
-
           try {
             const chatwootConfig = await waInstance.findChatwoot();
+
+            // 🔧 Seta o provider no contexto ANTES de enviar mensagens
+            this.provider = chatwootConfig;
+
+            await this.createBotMessage(
+              instance,
+              '🔄 Sincronizando mensagens perdidas das últimas 10 horas...',
+              'incoming',
+            );
+
             const prepare = (message: any) => {
               // Prepara mensagem (mesmo formato do baileys)
               return message;
@@ -1874,11 +1878,17 @@ export class ChatwootService {
           } catch (error) {
             this.logger.error(`[/lost command] Erro ao sincronizar mensagens: ${error.message}`);
             this.logger.error(`[/lost command] Stack: ${error.stack}`);
-            await this.createBotMessage(
-              instance,
-              `❌ Erro ao sincronizar mensagens: ${error.message}\n\nTente novamente mais tarde ou contate o suporte.`,
-              'incoming',
-            );
+
+            // 🔧 Tenta enviar mensagem de erro (pode falhar se provider não estiver setado)
+            try {
+              await this.createBotMessage(
+                instance,
+                `❌ Erro ao sincronizar mensagens: ${error.message}\n\nTente novamente mais tarde ou contate o suporte.`,
+                'incoming',
+              );
+            } catch (msgError) {
+              this.logger.error(`[/lost command] Erro ao enviar mensagem de erro: ${msgError.message}`);
+            }
           }
         }
 
