@@ -2749,7 +2749,13 @@ export class ChatwootService {
       const forwardIndicator = forwardCount > 1 ? `↪️ _Encaminhada ${forwardCount}x_\n\n` : `↪️ _Encaminhada_\n\n`;
 
       this.logger.log(`✅ Mensagem encaminhada detectada (score: ${forwardCount})`);
-      messageContent = forwardIndicator + messageContent;
+
+      // 🔧 FIX: Só adiciona indicador se messageContent existir (evita "undefined" em mídias sem caption)
+      if (messageContent) {
+        messageContent = forwardIndicator + messageContent;
+      } else {
+        messageContent = forwardIndicator.trim(); // Remove \n\n do final quando não tem conteúdo
+      }
     }
 
     return messageContent;
