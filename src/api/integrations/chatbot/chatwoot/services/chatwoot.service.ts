@@ -117,7 +117,19 @@ async function retryWithBackoff<T>(
 class MessageDeduplicationCache {
   private readonly logger = new Logger('MessageDeduplication');
   private cache: Map<string, number> = new Map(); // messageId -> timestamp
+  private contentCache: Map<string, number> = new Map(); // contentHash -> timestamp
   private readonly TTL_MS = 300000; // 5 minutos
+  private readonly CONTENT_TTL_MS = 30000; // 30 segundos para conteúdo (janela de duplicação)
+
+  /**
+   * Gera hash do conteúdo da mensagem para detecção de duplicatas
+   */
+  private generateContentHash(remoteJid: string, content: string, timestamp: number): string {
+    // Usa remoteJid + conteúdo + timestamp arredondado para 10 segundos
+    // Isso permite detectar mensagens idênticas enviadas em até 10 segundos
+    const roundedTimestamp = Math.floor(timestamp / 10000) * 10000;
+    return `${remoteJid}:${content}:${roundedTimestamp}`;
+  }
 
   public isDuplicate(messageId: string): boolean {
     const timestamp = this.cache.get(messageId);
@@ -132,15 +144,48 @@ class MessageDeduplicationCache {
       return false;
     }
 
-    this.logger.verbose(`Mensagem duplicada detectada: ${messageId}`);
+    this.logger.verbose(`Mensagem duplicada detectada por ID: ${messageId}`);
     return true;
   }
 
-  public markAsProcessed(messageId: string): void {
+  /**
+   * Verifica duplicata por conteúdo (para casos onde Baileys envia IDs diferentes)
+   */
+  public isDuplicateByContent(remoteJid: string, content: string, timestamp: number): boolean {
+    if (!content || !remoteJid) {
+      return false;
+    }
+
+    const contentHash = this.generateContentHash(remoteJid, content, timestamp);
+    const cachedTimestamp = this.contentCache.get(contentHash);
+
+    if (!cachedTimestamp) {
+      return false;
+    }
+
+    // Verifica se ainda está no TTL (30 segundos)
+    if (Date.now() - cachedTimestamp > this.CONTENT_TTL_MS) {
+      this.contentCache.delete(contentHash);
+      return false;
+    }
+
+    this.logger.warn(
+      `⚠️ Mensagem duplicada detectada por CONTEUDO: ${remoteJid} | Hash: ${contentHash.substring(0, 50)}...`,
+    );
+    return true;
+  }
+
+  public markAsProcessed(messageId: string, remoteJid?: string, content?: string, timestamp?: number): void {
     this.cache.set(messageId, Date.now());
 
+    // Marca conteúdo também se fornecido
+    if (remoteJid && content && timestamp) {
+      const contentHash = this.generateContentHash(remoteJid, content, timestamp);
+      this.contentCache.set(contentHash, Date.now());
+    }
+
     // Limpa cache periodicamente
-    if (this.cache.size > 1000) {
+    if (this.cache.size > 1000 || this.contentCache.size > 1000) {
       this.cleanup();
     }
   }
@@ -148,6 +193,7 @@ class MessageDeduplicationCache {
   private cleanup(): void {
     const now = Date.now();
     let cleaned = 0;
+    let contentCleaned = 0;
 
     for (const [messageId, timestamp] of this.cache.entries()) {
       if (now - timestamp > this.TTL_MS) {
@@ -156,8 +202,15 @@ class MessageDeduplicationCache {
       }
     }
 
-    if (cleaned > 0) {
-      this.logger.verbose(`Limpeza do cache: ${cleaned} mensagens antigas removidas`);
+    for (const [contentHash, timestamp] of this.contentCache.entries()) {
+      if (now - timestamp > this.CONTENT_TTL_MS) {
+        this.contentCache.delete(contentHash);
+        contentCleaned++;
+      }
+    }
+
+    if (cleaned > 0 || contentCleaned > 0) {
+      this.logger.verbose(`Limpeza do cache: ${cleaned} IDs e ${contentCleaned} conteúdos removidos`);
     }
   }
 }
@@ -1558,7 +1611,12 @@ export class ChatwootService {
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
         });
-        mimeType = response.headers['content-type'];
+        mimeType = response.headers['content-type'] || 'application/octet-stream';
+      }
+
+      // Garante que mimeType seja string valida
+      if (!mimeType || typeof mimeType !== 'string') {
+        mimeType = 'application/octet-stream';
       }
 
       let type = 'document';
@@ -2845,15 +2903,80 @@ export class ChatwootService {
     return messageContent;
   }
 
+  /**
+   * Extrai conteúdo de texto da mensagem para deduplicação
+   */
+  private extractMessageContent(body: any): string | null {
+    return (
+      body.message?.conversation ||
+      body.message?.extendedTextMessage?.text ||
+      body.message?.imageMessage?.caption ||
+      body.message?.videoMessage?.caption ||
+      body.message?.documentMessage?.caption ||
+      null
+    );
+  }
+
+  /**
+   * Normaliza o JID para deduplicação (sempre usa número real quando disponível)
+   */
+  private normalizeJidForDedup(body: any): string {
+    const remoteJid = body.key?.remoteJid;
+    const remoteJidAlt = body.key?.remoteJidAlt;
+
+    // Se tem remoteJidAlt e NÃO é LID, usa ele (é o número real)
+    if (remoteJidAlt && !remoteJidAlt.includes('@lid')) {
+      return remoteJidAlt;
+    }
+
+    // Se remoteJid NÃO é LID, usa ele
+    if (remoteJid && !remoteJid.includes('@lid')) {
+      return remoteJid;
+    }
+
+    // Se ambos são LID ou só tem um, usa o remoteJid
+    return remoteJid || remoteJidAlt || 'unknown';
+  }
+
+  /**
+   * Marca mensagem como processada no cache de deduplicação
+   */
+  private markMessageAsProcessed(instance: InstanceDto, body: any): void {
+    if (!body?.key?.id) return;
+
+    const messageId = `${instance.instanceName}_${body.key.id}`;
+    const messageContent = this.extractMessageContent(body);
+    const messageTimestamp = body.messageTimestamp ? body.messageTimestamp * 1000 : Date.now();
+    const normalizedJid = this.normalizeJidForDedup(body);
+
+    messageDeduplicationCache.markAsProcessed(messageId, normalizedJid, messageContent, messageTimestamp);
+    this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id} | JID normalizado: ${normalizedJid}`);
+  }
+
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
     try {
       // ✅ Anti-duplicata: Verifica se mensagem já foi processada
       if (event === Events.MESSAGES_UPSERT && body?.key?.id) {
         const messageId = `${instance.instanceName}_${body.key.id}`;
 
+        // Verifica duplicata por ID
         if (messageDeduplicationCache.isDuplicate(messageId)) {
-          this.logger.verbose(`Mensagem duplicada ignorada: ${body.key.id}`);
+          this.logger.verbose(`Mensagem duplicada ignorada por ID: ${body.key.id}`);
           return null;
+        }
+
+        // ✅ Verifica duplicata por CONTEÚDO (para casos onde Baileys envia IDs diferentes)
+        const messageContent = this.extractMessageContent(body);
+        const messageTimestamp = body.messageTimestamp ? body.messageTimestamp * 1000 : Date.now();
+        const normalizedJid = this.normalizeJidForDedup(body);
+
+        if (messageContent && normalizedJid) {
+          if (messageDeduplicationCache.isDuplicateByContent(normalizedJid, messageContent, messageTimestamp)) {
+            this.logger.warn(
+              `⚠️ Mensagem duplicada ignorada por CONTEUDO: ${body.key.id} | JID normalizado: ${normalizedJid}`,
+            );
+            return null;
+          }
         }
 
         // 🔧 FIX: NÃO marca como processada aqui!
@@ -2910,6 +3033,14 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
+        // ⏱️ Marca tempo de início do processamento
+        const startTime = Date.now();
+        const messageTimestamp = body.messageTimestamp ? body.messageTimestamp * 1000 : Date.now();
+        const receiveDelay = startTime - messageTimestamp;
+
+        this.logger.log(
+          `⏱️ [PERF] Mensagem recebida - ID: ${body.key.id} | Delay recebimento: ${receiveDelay}ms | Timestamp msg: ${new Date(messageTimestamp).toISOString()}`,
+        );
         this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
         if (body.key.remoteJid === 'status@broadcast') {
           return;
@@ -2964,6 +3095,11 @@ export class ChatwootService {
         }
 
         const getConversation = await this.createConversation(instance, body);
+
+        const conversationTime = Date.now();
+        this.logger.log(
+          `⏱️ [PERF] Conversa criada/encontrada - ID: ${body.key.id} | Tempo: ${conversationTime - startTime}ms`,
+        );
 
         if (!getConversation) {
           this.logger.warn(
@@ -3040,6 +3176,12 @@ export class ChatwootService {
               quotedMsg,
             );
 
+            const sendTime = Date.now();
+            const totalTime = sendTime - startTime;
+            this.logger.log(
+              `⏱️ [PERF] Mensagem MIDIA enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
+            );
+
             if (!send) {
               this.logger.warn('message not sent');
               return;
@@ -3064,6 +3206,12 @@ export class ChatwootService {
               body,
               'WAID:' + body.key.id,
               quotedMsg,
+            );
+
+            const sendTime = Date.now();
+            const totalTime = sendTime - startTime;
+            this.logger.log(
+              `⏱️ [PERF] Mensagem MIDIA enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
             );
 
             if (!send) {
@@ -3304,6 +3452,12 @@ export class ChatwootService {
             quotedMsg,
           );
 
+          const sendTime = Date.now();
+          const totalTime = sendTime - startTime;
+          this.logger.log(
+            `⏱️ [PERF] Mensagem GRUPO enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
+          );
+
           if (!send) {
             this.logger.warn('message not sent');
             return;
@@ -3328,6 +3482,12 @@ export class ChatwootService {
             body,
             'WAID:' + body.key.id,
             quotedMsg,
+          );
+
+          const sendTime = Date.now();
+          const totalTime = sendTime - startTime;
+          this.logger.log(
+            `⏱️ [PERF] Mensagem TEXTO enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
           );
 
           if (!send) {
