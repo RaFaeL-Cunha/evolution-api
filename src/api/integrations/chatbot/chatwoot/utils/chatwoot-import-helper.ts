@@ -315,9 +315,10 @@ class ChatwootImport {
 
       // processing messages in batch
       const batchSize = 4000;
-      let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
-      let batchNumber = 1;
       const totalBatches = Math.ceil(messagesOrdered.length / batchSize);
+      const messagesQueue = [...messagesOrdered];
+      let messagesChunk: Message[] = this.sliceIntoChunks(messagesQueue, batchSize);
+      let batchNumber = 1;
 
       this.logger.log(`🔄 Processando em ${totalBatches} lote(s) de até ${batchSize} mensagens`);
 
@@ -425,8 +426,12 @@ class ChatwootImport {
           } else {
             this.logger.warn(`⚠️ Lote ${batchNumber}: Nenhuma mensagem válida para importar no banco`);
           }
+        } else {
+          this.logger.warn(
+            `⚠️ Lote ${batchNumber}: Nenhum número mapeável para importação (possível LID sem resolução ou JIDs ignorados)`,
+          );
         }
-        messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
+        messagesChunk = this.sliceIntoChunks(messagesQueue, batchSize);
         batchNumber++;
       }
 
@@ -619,7 +624,13 @@ class ChatwootImport {
         try {
           const cached = await prismaRepository.isOnWhatsapp.findFirst({
             where: {
-              OR: [{ jidOptions: { contains: key.remoteJid } }, { remoteJid: key.remoteJid }],
+              OR: [
+                // Prefer explicit lid column when available
+                { lid: key.remoteJid },
+                // Backwards-compatible cache formats
+                { jidOptions: { contains: key.remoteJid } },
+                { remoteJid: key.remoteJid },
+              ],
             },
           });
 
