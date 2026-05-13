@@ -1600,22 +1600,45 @@ export class ChatwootService {
 
   public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
     try {
-      const parsedMedia = path.parse(decodeURIComponent(media));
-      let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
-      let fileName = parsedMedia?.name + parsedMedia?.ext;
+      // Tenta detectar extensao da URL primeiro (mais confiavel)
+      const urlParts = media.split('/');
+      const lastPart = urlParts[urlParts.length - 1]; // Ex: "biksrd.jpeg"
+      const extensionMatch = lastPart.match(/\.([a-zA-Z0-9]+)$/); // Pega extensao
 
+      let mimeType = '';
+      let fileName = lastPart;
+
+      // Se encontrou extensao na URL, usa ela
+      if (extensionMatch) {
+        const ext = '.' + extensionMatch[1]; // Ex: ".jpeg"
+        mimeType = mimeTypes.lookup(ext) || '';
+        this.logger.verbose(`Extensao detectada na URL: ${ext} -> mimeType: ${mimeType}`);
+      }
+
+      // Fallback: tenta com path.parse
+      if (!mimeType) {
+        const parsedMedia = path.parse(decodeURIComponent(media));
+        mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
+        fileName = parsedMedia?.name + parsedMedia?.ext;
+        this.logger.verbose(`Fallback path.parse: ${parsedMedia?.ext} -> mimeType: ${mimeType}`);
+      }
+
+      // Se ainda nao tem mimeType, faz requisicao para pegar content-type
       if (!mimeType) {
         const parts = media.split('/');
         fileName = decodeURIComponent(parts[parts.length - 1]);
 
+        this.logger.verbose(`Fazendo requisicao para obter content-type: ${media}`);
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
         });
         mimeType = response.headers['content-type'] || 'application/octet-stream';
+        this.logger.verbose(`Content-type do servidor: ${mimeType}`);
       }
 
       // Garante que mimeType seja string valida
       if (!mimeType || typeof mimeType !== 'string') {
+        this.logger.warn(`mimeType invalido, usando fallback: ${mimeType}`);
         mimeType = 'application/octet-stream';
       }
 
@@ -1655,7 +1678,9 @@ export class ChatwootService {
       }
 
       const documentExtensions = ['.gif', '.svg', '.tiff', '.tif', '.dxf', '.dwg'];
-      if (type === 'image' && parsedMedia && documentExtensions.includes(parsedMedia?.ext)) {
+      // Verifica se a extensao do arquivo indica que deve ser documento
+      const fileExtension = fileName.match(/\.([a-zA-Z0-9]+)$/)?.[0] || '';
+      if (type === 'image' && documentExtensions.includes(fileExtension.toLowerCase())) {
         type = 'document';
       }
 
