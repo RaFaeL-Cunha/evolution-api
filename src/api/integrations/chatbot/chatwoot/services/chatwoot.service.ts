@@ -2718,9 +2718,18 @@ export class ChatwootService {
 
     // Log de warning se nenhum tipo foi encontrado (para debug)
     if (!typeKey) {
+      // Mostra quais tipos tem valor (não undefined)
+      const typesWithValue = Object.keys(types)
+        .filter((key) => types[key] !== undefined)
+        .map((key) => `${key}: ${typeof types[key]}`);
+
       this.logger.warn(
-        `⚠️ getMessageContent: Nenhum tipo de mensagem encontrado - Types: ${JSON.stringify(Object.keys(types))}`,
+        `⚠️ getMessageContent: Nenhum tipo de mensagem encontrado - Keys: ${JSON.stringify(Object.keys(types))}`,
       );
+      this.logger.warn(
+        `⚠️ getMessageContent: Tipos com valor: ${typesWithValue.length > 0 ? JSON.stringify(typesWithValue) : 'NENHUM'}`,
+      );
+      this.logger.warn(`⚠️ getMessageContent: Estrutura completa: ${JSON.stringify(types, null, 2)}`);
     }
 
     return result;
