@@ -5906,25 +5906,26 @@ export class BaileysStartupService extends ChannelStartupService {
    * @returns true se a foto mudou ou é a primeira verificação
    */
   private hasProfilePictureChanged(remoteJid: string, currentUrl: string | null): boolean {
-    const CACHE_TTL = 30 * 60 * 1000; // 30 minutos
+    const CACHE_TTL = 15 * 60 * 1000; // 15 minutos
     const now = Date.now();
     const cached = this.profilePictureCache.get(remoteJid);
 
     // Se não tem cache ou o cache expirou, considera como mudança
     if (!cached || now - cached.timestamp > CACHE_TTL) {
       this.profilePictureCache.set(remoteJid, { url: currentUrl, timestamp: now });
+      this.logger.log(`📸 Cache expirado ou primeira vez para ${remoteJid} - Atualizando foto`);
       return true;
     }
 
     // Se a URL mudou, atualiza o cache e retorna true
     if (cached.url !== currentUrl) {
       this.profilePictureCache.set(remoteJid, { url: currentUrl, timestamp: now });
-      this.logger.verbose(`📸 Foto de perfil mudou para ${remoteJid}: ${cached.url} → ${currentUrl}`);
+      this.logger.log(`📸 Foto de perfil mudou para ${remoteJid}: ${cached.url} → ${currentUrl}`);
       return true;
     }
 
     // Foto não mudou
-    this.logger.verbose(`ℹ️ Foto de perfil não mudou para ${remoteJid}, ignorando evento`);
+    this.logger.verbose(`ℹ️ Foto de perfil nao mudou para ${remoteJid}, ignorando evento`);
     return false;
   }
 
