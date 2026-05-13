@@ -3584,7 +3584,8 @@ export class ChatwootService {
 
       // 📸 CONTACTS_UPDATE - Atualiza foto de perfil quando contato muda
       if (event === Events.CONTACTS_UPDATE) {
-        this.logger.verbose(`📸 Evento CONTACTS_UPDATE recebido para ${instance.instanceName}`);
+        this.logger.log(`📸 Evento CONTACTS_UPDATE recebido para ${instance.instanceName}`);
+        this.logger.log(`📸 Body completo: ${JSON.stringify(body, null, 2)}`);
 
         // body pode ser um objeto único ou array
         const contacts = Array.isArray(body) ? body : [body];
@@ -3594,26 +3595,33 @@ export class ChatwootService {
             const remoteJid = contactData.remoteJid;
             const profilePicUrl = contactData.profilePicUrl;
 
+            this.logger.log(`📸 Processando contato: ${remoteJid} | Foto: ${profilePicUrl}`);
+
             if (!remoteJid || !profilePicUrl) {
-              this.logger.verbose(`Contato sem foto ou JID inválido: ${remoteJid}`);
+              this.logger.warn(`⚠️ Contato sem foto ou JID invalido: ${remoteJid}`);
               continue;
             }
 
             // Busca o contato no Chatwoot
             const chatId = remoteJid.split('@')[0].split(':')[0];
+            this.logger.log(`📸 Buscando contato ${chatId} no Chatwoot...`);
             const contact = await this.findContact(instance, chatId);
 
             if (contact) {
-              this.logger.log(`📸 Atualizando foto do contato ${chatId} no Chatwoot`);
+              this.logger.log(`📸 Contato encontrado! ID: ${contact.id} | Nome: ${contact.name}`);
+              this.logger.log(`📸 Atualizando foto do contato ${chatId} no Chatwoot com URL: ${profilePicUrl}`);
+
               await this.updateContact(instance, contact.id, {
                 avatar_url: profilePicUrl,
               });
+
               this.logger.log(`✅ Foto atualizada com sucesso para ${chatId}`);
             } else {
-              this.logger.verbose(`Contato ${chatId} não encontrado no Chatwoot`);
+              this.logger.warn(`⚠️ Contato ${chatId} nao encontrado no Chatwoot`);
             }
           } catch (error) {
-            this.logger.error(`Erro ao atualizar foto do contato: ${error.message}`);
+            this.logger.error(`❌ Erro ao atualizar foto do contato: ${error.message}`);
+            this.logger.error(`Stack: ${error.stack}`);
           }
         }
         return;

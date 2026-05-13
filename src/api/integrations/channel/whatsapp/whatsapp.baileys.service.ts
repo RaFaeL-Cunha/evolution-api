@@ -1937,9 +1937,13 @@ export class BaileysStartupService extends ChannelStartupService {
           if (contact) {
             // ✅ Só envia evento CONTACTS_UPDATE se a foto realmente mudou
             if (this.hasProfilePictureChanged(contactRaw.remoteJid, contactRaw.profilePicUrl)) {
+              this.logger.log(
+                `📸 [Baileys] Foto mudou para ${contactRaw.remoteJid} - Disparando evento CONTACTS_UPDATE`,
+              );
               this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
 
               if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                this.logger.log(`📸 [Baileys] Enviando evento para Chatwoot...`);
                 await this.chatwootService.eventWhatsapp(
                   Events.CONTACTS_UPDATE,
                   {
@@ -1949,6 +1953,8 @@ export class BaileysStartupService extends ChannelStartupService {
                   contactRaw,
                 );
               }
+            } else {
+              this.logger.verbose(`ℹ️ [Baileys] Foto nao mudou para ${contactRaw.remoteJid} - Ignorando evento`);
             }
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
