@@ -14,6 +14,7 @@ export class Options {
   mentionsEveryOne?: boolean;
   mentioned?: string[];
   webhookUrl?: string;
+  contextInfo?: any; // ✅ Para mensagens encaminhadas (isForwarded, forwardingScore, etc)
 }
 
 export class MediaMessage {

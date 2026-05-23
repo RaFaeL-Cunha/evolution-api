@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
+import { getChatwootSendErrorMessage } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-error-message';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -113,21 +114,40 @@ async function retryWithBackoff<T>(
 
 /**
  * Cache simples para evitar duplicatas de mensagens
+ *
+ * ESTRATEGIA ANTI-DUPLICATA:
+ * 1. Cache de "em processamento" (processing) - TTL curto (5s) para prevenir race condition
+ * 2. Cache de "processado" (processed) - TTL longo (5min) para evitar reprocessamento
+ *
+ * Isso permite:
+ * - Bloquear duplicatas que chegam ao mesmo tempo (race condition)
+ * - Permitir retentativas em caso de erro (processing expira rapido)
+ * - Evitar reprocessamento de mensagens ja enviadas (processed dura mais)
  */
 class MessageDeduplicationCache {
   private readonly logger = new Logger('MessageDeduplication');
   private cache: Map<string, number> = new Map(); // messageId -> timestamp
-  private contentCache: Map<string, number> = new Map(); // contentHash -> timestamp
+  private contentCache: Map<string, number> = new Map(); // contentHash -> timestamp (processado)
+  private processingCache: Map<string, number> = new Map(); // contentHash -> timestamp (em processamento)
   private readonly TTL_MS = 300000; // 5 minutos
   private readonly CONTENT_TTL_MS = 30000; // 30 segundos para conteúdo (janela de duplicação)
+  private readonly PROCESSING_TTL_MS = 5000; // 5 segundos para "em processamento"
 
   /**
    * Gera hash do conteúdo da mensagem para detecção de duplicatas
+   * USA timestamp arredondado para 1 segundo para diferenciar:
+   * - Duplicatas do Baileys (mesmo timestamp ou < 1s) - BLOQUEIA
+   * - Mensagens identicas legitimas (timestamps > 1s) - PERMITE
+   *
+   * Exemplo:
+   * - Usuario manda "ola" as 10:00:00.500 -> hash: "123:ola:10:00:00"
+   * - Baileys duplica "ola" as 10:00:00.800 -> hash: "123:ola:10:00:00" (BLOQUEADO)
+   * - Usuario manda "ola" de novo as 10:00:02.000 -> hash: "123:ola:10:00:02" (PERMITIDO)
    */
   private generateContentHash(remoteJid: string, content: string, timestamp: number): string {
-    // Usa remoteJid + conteúdo + timestamp arredondado para 10 segundos
-    // Isso permite detectar mensagens idênticas enviadas em até 10 segundos
-    const roundedTimestamp = Math.floor(timestamp / 10000) * 10000;
+    // Arredonda timestamp para janela de 1 segundo
+    // Isso permite que mensagens identicas enviadas com >1s de diferenca passem
+    const roundedTimestamp = Math.floor(timestamp / 1000) * 1000;
     return `${remoteJid}:${content}:${roundedTimestamp}`;
   }
 
@@ -149,7 +169,8 @@ class MessageDeduplicationCache {
   }
 
   /**
-   * Verifica duplicata por conteúdo (para casos onde Baileys envia IDs diferentes)
+   * Verifica se mensagem esta em processamento OU ja foi processada
+   * Retorna true se for duplicata (deve ser bloqueada)
    */
   public isDuplicateByContent(remoteJid: string, content: string, timestamp: number): boolean {
     if (!content || !remoteJid) {
@@ -157,35 +178,81 @@ class MessageDeduplicationCache {
     }
 
     const contentHash = this.generateContentHash(remoteJid, content, timestamp);
-    const cachedTimestamp = this.contentCache.get(contentHash);
+    const now = Date.now();
 
-    if (!cachedTimestamp) {
-      return false;
+    // 1. Verifica se esta em processamento (race condition)
+    const processingTimestamp = this.processingCache.get(contentHash);
+    if (processingTimestamp) {
+      const age = now - processingTimestamp;
+      if (age <= this.PROCESSING_TTL_MS) {
+        this.logger.warn(
+          `⚠️ DUPLICATA DETECTADA - EM PROCESSAMENTO: ${remoteJid} | Age: ${age}ms | Hash: ${contentHash.substring(0, 50)}...`,
+        );
+        return true; // Duplicata! Outra mensagem identica esta sendo processada
+      } else {
+        // Expirou - remove do cache
+        this.processingCache.delete(contentHash);
+      }
     }
 
-    // Verifica se ainda está no TTL (30 segundos)
-    if (Date.now() - cachedTimestamp > this.CONTENT_TTL_MS) {
-      this.contentCache.delete(contentHash);
-      return false;
+    // 2. Verifica se ja foi processada
+    const processedTimestamp = this.contentCache.get(contentHash);
+    if (processedTimestamp) {
+      const age = now - processedTimestamp;
+      if (age <= this.CONTENT_TTL_MS) {
+        this.logger.warn(
+          `⚠️ DUPLICATA DETECTADA - JA PROCESSADA: ${remoteJid} | Age: ${age}ms | Hash: ${contentHash.substring(0, 50)}...`,
+        );
+        return true; // Duplicata! Mensagem ja foi processada
+      } else {
+        // Expirou - remove do cache
+        this.contentCache.delete(contentHash);
+      }
     }
 
-    this.logger.warn(
-      `⚠️ Mensagem duplicada detectada por CONTEUDO: ${remoteJid} | Hash: ${contentHash.substring(0, 50)}...`,
-    );
-    return true;
+    return false; // Nao e duplicata
   }
 
+  /**
+   * Marca mensagem como "em processamento" para prevenir race condition
+   * Deve ser chamado IMEDIATAMENTE apos verificar que nao e duplicata
+   */
+  public markAsProcessing(remoteJid: string, content: string, timestamp: number): void {
+    if (!content || !remoteJid) {
+      return;
+    }
+
+    const contentHash = this.generateContentHash(remoteJid, content, timestamp);
+    this.processingCache.set(contentHash, Date.now());
+    this.logger.verbose(
+      `🔒 Marcado como EM PROCESSAMENTO: ${contentHash.substring(0, 80)} | Cache size: ${this.processingCache.size}`,
+    );
+  }
+
+  /**
+   * Marca mensagem como processada (sucesso ou erro)
+   * Remove do cache de "em processamento" e adiciona ao cache de "processado"
+   */
   public markAsProcessed(messageId: string, remoteJid?: string, content?: string, timestamp?: number): void {
     this.cache.set(messageId, Date.now());
 
     // Marca conteúdo também se fornecido
     if (remoteJid && content && timestamp) {
       const contentHash = this.generateContentHash(remoteJid, content, timestamp);
+
+      // Remove do cache de processamento
+      this.processingCache.delete(contentHash);
+
+      // Adiciona ao cache de processado
       this.contentCache.set(contentHash, Date.now());
+
+      this.logger.verbose(
+        `✅ Marcado como PROCESSADO: ${contentHash.substring(0, 80)} | Cache size: ${this.contentCache.size}`,
+      );
     }
 
     // Limpa cache periodicamente
-    if (this.cache.size > 1000 || this.contentCache.size > 1000) {
+    if (this.cache.size > 1000 || this.contentCache.size > 1000 || this.processingCache.size > 100) {
       this.cleanup();
     }
   }
@@ -194,6 +261,7 @@ class MessageDeduplicationCache {
     const now = Date.now();
     let cleaned = 0;
     let contentCleaned = 0;
+    let processingCleaned = 0;
 
     for (const [messageId, timestamp] of this.cache.entries()) {
       if (now - timestamp > this.TTL_MS) {
@@ -209,14 +277,77 @@ class MessageDeduplicationCache {
       }
     }
 
-    if (cleaned > 0 || contentCleaned > 0) {
-      this.logger.verbose(`Limpeza do cache: ${cleaned} IDs e ${contentCleaned} conteúdos removidos`);
+    for (const [contentHash, timestamp] of this.processingCache.entries()) {
+      if (now - timestamp > this.PROCESSING_TTL_MS) {
+        this.processingCache.delete(contentHash);
+        processingCleaned++;
+      }
+    }
+
+    if (cleaned > 0 || contentCleaned > 0 || processingCleaned > 0) {
+      this.logger.verbose(
+        `Limpeza do cache: ${cleaned} IDs, ${contentCleaned} processados, ${processingCleaned} em processamento removidos`,
+      );
     }
   }
 }
 
 // Singleton para cache de deduplicação
 const messageDeduplicationCache = new MessageDeduplicationCache();
+
+/**
+ * Cache para deduplicação de mensagens DELETE
+ * Previne processamento duplicado de eventos de deleção
+ */
+class DeleteDeduplicationCache {
+  private readonly logger = new Logger('DeleteDeduplication');
+  private cache: Map<string, number> = new Map();
+  private readonly TTL_MS = 15000; // 15 segundos
+
+  public isDuplicate(key: string): boolean {
+    const timestamp = this.cache.get(key);
+
+    if (!timestamp) {
+      return false;
+    }
+
+    // Verifica se ainda está no TTL
+    if (Date.now() - timestamp > this.TTL_MS) {
+      this.cache.delete(key);
+      return false;
+    }
+
+    return true;
+  }
+
+  public markAsProcessed(key: string): void {
+    this.cache.set(key, Date.now());
+
+    // Cleanup periódico quando cache cresce muito
+    if (this.cache.size > 1000) {
+      this.cleanup();
+    }
+  }
+
+  private cleanup(): void {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [key, timestamp] of this.cache.entries()) {
+      if (now - timestamp > this.TTL_MS) {
+        this.cache.delete(key);
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      this.logger.verbose(`Limpeza do cache de DELETE: ${cleaned} itens removidos`);
+    }
+  }
+}
+
+// Singleton para cache de deduplicação de DELETE
+const deleteDeduplicationCache = new DeleteDeduplicationCache();
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
@@ -1600,33 +1731,47 @@ export class ChatwootService {
 
   public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
     try {
+      // ✅ Validação inicial
+      if (!media || typeof media !== 'string') {
+        throw new Error(`URL de mídia inválida: ${media}`);
+      }
+
       // Tenta detectar extensao da URL primeiro (mais confiavel)
       const urlParts = media.split('/');
-      const lastPart = urlParts[urlParts.length - 1]; // Ex: "biksrd.jpeg"
+      const lastPart = urlParts[urlParts.length - 1] || ''; // ✅ Fallback para string vazia
       const extensionMatch = lastPart.match(/\.([a-zA-Z0-9]+)$/); // Pega extensao
 
       let mimeType = '';
-      let fileName = lastPart;
+      let fileName = lastPart || 'file'; // ✅ Fallback para 'file'
 
       // Se encontrou extensao na URL, usa ela
       if (extensionMatch) {
         const ext = '.' + extensionMatch[1]; // Ex: ".jpeg"
-        mimeType = mimeTypes.lookup(ext) || '';
+        const lookedUpMimeType = mimeTypes.lookup(ext);
+        mimeType = lookedUpMimeType ? lookedUpMimeType.toString() : '';
         this.logger.verbose(`Extensao detectada na URL: ${ext} -> mimeType: ${mimeType}`);
       }
 
       // Fallback: tenta com path.parse
       if (!mimeType) {
-        const parsedMedia = path.parse(decodeURIComponent(media));
-        mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
-        fileName = parsedMedia?.name + parsedMedia?.ext;
-        this.logger.verbose(`Fallback path.parse: ${parsedMedia?.ext} -> mimeType: ${mimeType}`);
+        try {
+          const parsedMedia = path.parse(decodeURIComponent(media));
+          const lookedUpMimeType = mimeTypes.lookup(parsedMedia?.ext);
+          mimeType = lookedUpMimeType ? lookedUpMimeType.toString() : '';
+          // ✅ Garante que name e ext não sejam undefined
+          const name = parsedMedia?.name || 'file';
+          const ext = parsedMedia?.ext || '';
+          fileName = name + ext;
+          this.logger.verbose(`Fallback path.parse: ${ext} -> mimeType: ${mimeType}`);
+        } catch (error) {
+          this.logger.warn(`Erro ao fazer parse da URL: ${error.message}`);
+        }
       }
 
       // Se ainda nao tem mimeType, faz requisicao para pegar content-type
       if (!mimeType) {
         const parts = media.split('/');
-        fileName = decodeURIComponent(parts[parts.length - 1]);
+        fileName = decodeURIComponent(parts[parts.length - 1] || 'file'); // ✅ Fallback
 
         this.logger.verbose(`Fazendo requisicao para obter content-type: ${media}`);
         const response = await axios.get(media, {
@@ -1672,14 +1817,16 @@ export class ChatwootService {
 
         sendTelemetry('/message/sendWhatsAppAudio');
 
-        const messageSent = await waInstance?.audioWhatsapp(data, contextInfo, true);
+        // ✅ Passa contextInfo nas options para audioWhatsapp
+        const audioOptions = contextInfo ? { ...options, contextInfo } : options;
+        const messageSent = await waInstance?.audioWhatsapp(data, false, true, audioOptions);
 
         return messageSent;
       }
 
       const documentExtensions = ['.gif', '.svg', '.tiff', '.tif', '.dxf', '.dwg'];
-      // Verifica se a extensao do arquivo indica que deve ser documento
-      const fileExtension = fileName.match(/\.([a-zA-Z0-9]+)$/)?.[0] || '';
+      // ✅ Garante que fileName não seja undefined antes de fazer match
+      const fileExtension = (fileName || '').match(/\.([a-zA-Z0-9]+)$/)?.[0] || '';
       if (type === 'image' && documentExtensions.includes(fileExtension.toLowerCase())) {
         type = 'document';
       }
@@ -1687,7 +1834,7 @@ export class ChatwootService {
       const data: SendMediaDto = {
         number: number,
         mediatype: type as any,
-        fileName: fileName,
+        fileName: fileName || 'file', // ✅ Garante que nunca seja undefined
         media: media,
         delay: 1200,
         quoted: options?.quoted,
@@ -1699,11 +1846,13 @@ export class ChatwootService {
         data.caption = caption;
       }
 
-      const messageSent = await waInstance?.mediaMessage(data, contextInfo, true);
+      // ✅ Passa contextInfo nas options para mediaMessage
+      const mediaOptions = contextInfo ? { ...options, contextInfo } : options;
+      const messageSent = await waInstance?.mediaMessage(data, false, true, mediaOptions);
 
       return messageSent;
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(`Erro em sendAttachment: ${error.message || error}`);
       throw error; // Re-throw para que o erro seja tratado pelo caller
     }
   }
@@ -1717,27 +1866,13 @@ export class ChatwootService {
       return;
     }
 
-    if (error && error?.status === 400 && error?.message[0]?.exists === false) {
-      client.messages.create({
-        accountId: this.provider.accountId,
-        conversationId: conversation,
-        data: {
-          content: `${i18next.t('cw.message.numbernotinwhatsapp')}`,
-          message_type: 'outgoing',
-          private: true,
-        },
-      });
-
-      return;
-    }
+    const content = getChatwootSendErrorMessage(error);
 
     client.messages.create({
       accountId: this.provider.accountId,
       conversationId: conversation,
       data: {
-        content: i18next.t('cw.message.notsent', {
-          error: error ? `_${error.toString()}_` : '',
-        }),
+        content,
         message_type: 'outgoing',
         private: true,
       },
@@ -2971,10 +3106,9 @@ export class ChatwootService {
 
     const messageId = `${instance.instanceName}_${body.key.id}`;
     const messageContent = this.extractMessageContent(body);
-    const messageTimestamp = body.messageTimestamp ? body.messageTimestamp * 1000 : Date.now();
     const normalizedJid = this.normalizeJidForDedup(body);
 
-    messageDeduplicationCache.markAsProcessed(messageId, normalizedJid, messageContent, messageTimestamp);
+    messageDeduplicationCache.markAsProcessed(messageId, normalizedJid, messageContent);
     this.logger.verbose(`✅ Mensagem marcada como processada: ${body.key.id} | JID normalizado: ${normalizedJid}`);
   }
 
@@ -2996,17 +3130,21 @@ export class ChatwootService {
         const normalizedJid = this.normalizeJidForDedup(body);
 
         if (messageContent && normalizedJid) {
+          // Verifica se e duplicata (em processamento OU ja processada)
           if (messageDeduplicationCache.isDuplicateByContent(normalizedJid, messageContent, messageTimestamp)) {
             this.logger.warn(
               `⚠️ Mensagem duplicada ignorada por CONTEUDO: ${body.key.id} | JID normalizado: ${normalizedJid}`,
             );
             return null;
           }
+
+          // 🔒 Marca como "em processamento" IMEDIATAMENTE para prevenir race condition
+          // Se outra mensagem identica chegar no mesmo segundo, sera bloqueada
+          messageDeduplicationCache.markAsProcessing(normalizedJid, messageContent, messageTimestamp);
         }
 
-        // 🔧 FIX: NÃO marca como processada aqui!
-        // Só marca DEPOIS que a mensagem for enviada com sucesso
-        // Caso contrário, se falhar e ir pra fila, não consegue reprocessar
+        // ⚠️ NÃO marca como processado aqui! Só marca após processar com sucesso
+        // Isso permite retry em caso de erro e previne perda de mensagens
       }
 
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
@@ -3068,6 +3206,14 @@ export class ChatwootService {
         );
         this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
         if (body.key.remoteJid === 'status@broadcast') {
+          return;
+        }
+
+        // 🔧 FIX: Ignora protocolMessage (edições/revogações) - serão tratadas pelos eventos específicos
+        if (body.message?.protocolMessage) {
+          this.logger.verbose(
+            '[messages.upsert] Ignorando protocolMessage - será tratado por messages.edit ou messages.delete',
+          );
           return;
         }
 
@@ -3384,7 +3530,8 @@ export class ChatwootService {
           const imgBuffer = await axios.get(adsMessage.thumbnailUrl, { responseType: 'arraybuffer' });
 
           const extension = mimeTypes.extension(imgBuffer.headers['content-type']);
-          const mimeType = extension && mimeTypes.lookup(extension);
+          const lookedUpMimeType = extension && mimeTypes.lookup(extension);
+          const mimeType = lookedUpMimeType ? lookedUpMimeType.toString() : '';
 
           if (!mimeType) {
             this.logger.warn('mimetype of Ads message not found');
@@ -3392,7 +3539,8 @@ export class ChatwootService {
           }
 
           const random = Math.random().toString(36).substring(7);
-          const nameFile = `${random}.${mimeTypes.extension(mimeType)}`;
+          const fileExtension = mimeTypes.extension(mimeType) || 'bin';
+          const nameFile = `${random}.${fileExtension}`;
           const fileData = Buffer.from(imgBuffer.data, 'binary');
 
           const img = await Jimp.read(fileData);
@@ -3533,21 +3681,15 @@ export class ChatwootService {
       //  DELETE
       // Hard delete quando habilitado; senão cria placeholder "apagada pelo remetente"
       if (event === Events.MESSAGES_DELETE) {
-        // Anti-dup local (process-wide) por 15s (Otimizado para 1 contêiner)
-
+        // ✅ Anti-duplicata usando DeleteDeduplicationCache (com cleanup automático)
         const dedupKey = `cw_del_${instance.instanceId}_${body?.key?.id}`;
-        const g = global as any;
-        if (!g.__cwDel) g.__cwDel = new Map<string, number>();
 
-        const last = g.__cwDel.get(dedupKey);
-        const now = Date.now();
-
-        if (last && now - last < 15000) {
+        if (deleteDeduplicationCache.isDuplicate(dedupKey)) {
           this.logger.info(`[CW.DELETE] Ignorado (duplicado local) para ${body?.key?.id}`);
           return;
         }
 
-        g.__cwDel.set(dedupKey, now);
+        deleteDeduplicationCache.markAsProcessed(dedupKey);
 
         const chatwootDelete = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_DELETE;
 

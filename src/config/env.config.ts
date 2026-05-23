@@ -743,7 +743,7 @@ export class ConfigService {
       DEL_TEMP_INSTANCES: isBooleanString(process.env?.DEL_TEMP_INSTANCES)
         ? process.env.DEL_TEMP_INSTANCES === 'true'
         : true,
-      LANGUAGE: process.env?.LANGUAGE || 'en',
+      LANGUAGE: process.env?.LANGUAGE || 'pt-BR',
       WEBHOOK: {
         GLOBAL: {
           URL: process.env?.WEBHOOK_GLOBAL_URL || '',

@@ -21,7 +21,15 @@
   "cw.contactMessage.contact": "Contato",
   "cw.contactMessage.name": "Nome",
   "cw.contactMessage.number": "Número",
-  "cw.message.notsent": "🚨 Não foi possível enviar a mensagem. Verifique sua conexão. {{error}}",
-  "cw.message.numbernotinwhatsapp": "🚨 A mensagem não foi enviada, pois o contato não é um número válido do WhatsApp.",
-  "cw.message.edited": "Mensagem editada"
+  "cw.message.notsent": "🚨 Não foi possível enviar a mensagem. Verifique sua conexão.",
+  "cw.message.numbernotinwhatsapp": "🚨 Este número não está registrado no WhatsApp. Verifique se o número está correto.",
+  "cw.message.edited": "Mensagem editada",
+  "cw.error.instanceDisconnected": "⚠️ Sua instância do WhatsApp está desconectada. Por favor, reconecte escaneando o QR Code.",
+  "cw.error.numberNotExists": "❌ Este número não existe no WhatsApp. Verifique se digitou corretamente.",
+  "cw.error.uploadFailed": "📎 Não foi possível enviar o arquivo. Tente novamente ou use um arquivo menor.",
+  "cw.error.connectionFailed": "🔌 Falha na conexão com o WhatsApp. Aguarde alguns instantes e tente novamente.",
+  "cw.error.afterAttempts": "⏱️ Não foi possível enviar após {{attempts}} tentativas.",
+  "cw.error.retryFailed": "⏱️ A mensagem não pôde ser enviada após várias tentativas. Verifique sua conexão e tente novamente.",
+  "cw.error.invalidMedia": "🖼️ O arquivo enviado está corrompido ou em formato inválido. Tente enviar outro arquivo.",
+  "cw.error.generic": "❌ Ocorreu um erro ao processar sua solicitação. Tente novamente em alguns instantes."
 }

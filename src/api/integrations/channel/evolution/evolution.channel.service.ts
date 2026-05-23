@@ -678,9 +678,9 @@ export class EvolutionStartupService extends ChannelStartupService {
       };
 
       if (isURL(audio)) {
-        mimetype = mimeTypes.lookup(audio).toString();
+        mimetype = mimeTypes.lookup(audio)?.toString() || 'audio/mpeg';
       } else {
-        mimetype = mimeTypes.lookup(prepareMedia.fileName).toString();
+        mimetype = mimeTypes.lookup(prepareMedia.fileName)?.toString() || 'audio/mpeg';
       }
 
       prepareMedia.mimetype = mimetype;

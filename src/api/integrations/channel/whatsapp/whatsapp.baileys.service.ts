@@ -1792,12 +1792,14 @@ export class BaileysStartupService extends ChannelStartupService {
                     }
 
                     const { buffer, mediaType, fileName, size } = media;
-                    const mimetype = mimeTypes.lookup(fileName).toString();
+                    // ✅ Proteção contra fileName undefined (mensagens encaminhadas)
+                    const safeFileName = fileName || `file_${Date.now()}`;
+                    const mimetype = mimeTypes.lookup(safeFileName)?.toString() || 'application/octet-stream';
                     const fullName = join(
                       `${this.instance.id}`,
                       received.key.remoteJid,
                       mediaType,
-                      `${Date.now()}_${fileName}`,
+                      `${Date.now()}_${safeFileName}`,
                     );
                     await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
@@ -3051,6 +3053,30 @@ export class BaileysStartupService extends ChannelStartupService {
       let mentions: string[];
       let contextInfo: any;
 
+      // 🔧 FIX: Injeta contextInfo DENTRO do objeto da mensagem de mídia para mensagens encaminhadas
+      if (options?.contextInfo) {
+        const mediaTypes = [
+          'imageMessage',
+          'videoMessage',
+          'audioMessage',
+          'documentMessage',
+          'documentWithCaptionMessage',
+          'stickerMessage',
+          'ptvMessage',
+        ];
+
+        for (const mediaType of mediaTypes) {
+          if (message[mediaType] && typeof message[mediaType] === 'object') {
+            this.logger.verbose(`Injetando contextInfo em ${mediaType} para mensagem encaminhada`);
+            message[mediaType].contextInfo = {
+              ...message[mediaType].contextInfo,
+              ...options.contextInfo,
+            };
+            break;
+          }
+        }
+      }
+
       if (isJidGroup(sender) && !sender.endsWith('@lid')) {
         let group;
         try {
@@ -3178,14 +3204,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
               const { buffer, mediaType, fileName, size } = media;
 
-              const mimetype = mimeTypes.lookup(fileName).toString();
+              // ✅ Proteção contra fileName undefined (mensagens encaminhadas)
+              const safeFileName = fileName || `file_${Date.now()}`;
+              const mimetype = mimeTypes.lookup(safeFileName)?.toString() || 'application/octet-stream';
 
               const fullName = join(
                 `${this.instance.id}`,
                 messageRaw.key.remoteJid,
                 `${messageRaw.key.id}`,
                 mediaType,
-                fileName,
+                safeFileName,
               );
 
               await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
@@ -3548,7 +3576,9 @@ export class BaileysStartupService extends ChannelStartupService {
       if (mediaMessage.mimetype) {
         mimetype = mediaMessage.mimetype;
       } else {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName);
+        // ✅ Proteção contra fileName undefined (mensagens encaminhadas)
+        const safeFileName = mediaMessage.fileName || 'file';
+        mimetype = mimeTypes.lookup(safeFileName);
 
         if (!mimetype && isURL(mediaMessage.media)) {
           let config: any = { responseType: 'arraybuffer' };
@@ -3607,9 +3637,13 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if (mediaMessage?.fileName) {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName).toString();
-        if (mimetype === 'application/mp4') {
-          mimetype = 'video/mp4';
+        // ✅ Proteção contra lookup retornar false
+        const lookedUpMimetype = mimeTypes.lookup(mediaMessage.fileName);
+        if (lookedUpMimetype && typeof lookedUpMimetype === 'string') {
+          mimetype = lookedUpMimetype;
+          if (mimetype === 'application/mp4') {
+            mimetype = 'video/mp4';
+          }
         }
       }
 
@@ -3717,7 +3751,7 @@ export class BaileysStartupService extends ChannelStartupService {
     return result;
   }
 
-  public async mediaMessage(data: SendMediaDto, file?: any, isIntegration = false) {
+  public async mediaMessage(data: SendMediaDto, file?: any, isIntegration = false, options?: any) {
     const mediaData: SendMediaDto = { ...data };
 
     if (file) mediaData.media = file.buffer.toString('base64');
@@ -3739,6 +3773,7 @@ export class BaileysStartupService extends ChannelStartupService {
         quoted: data?.quoted,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        contextInfo: options?.contextInfo, // ✅ Passa contextInfo para sendMessageWithTyping
       },
       isIntegration,
     );
@@ -3951,7 +3986,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async audioWhatsapp(data: SendAudioDto, file?: any, isIntegration = false) {
+  public async audioWhatsapp(data: SendAudioDto, file?: any, isIntegration = false, options?: any) {
     const mediaData: SendAudioDto = { ...data };
 
     if (file?.buffer) {
@@ -3972,7 +4007,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const result = this.sendMessageWithTyping<AnyMessageContent>(
           data.number,
           { audio: convert, ptt: true, mimetype: 'audio/ogg; codecs=opus' },
-          { presence: 'recording', delay: data?.delay },
+          { presence: 'recording', delay: data?.delay, contextInfo: options?.contextInfo }, // ✅ Passa contextInfo
           isIntegration,
         );
 
@@ -3989,7 +4024,7 @@ export class BaileysStartupService extends ChannelStartupService {
         ptt: true,
         mimetype: 'audio/ogg; codecs=opus',
       },
-      { presence: 'recording', delay: data?.delay },
+      { presence: 'recording', delay: data?.delay, contextInfo: options?.contextInfo }, // ✅ Passa contextInfo
       isIntegration,
     );
   }
@@ -4743,8 +4778,8 @@ export class BaileysStartupService extends ChannelStartupService {
       }
       const typeMessage = getContentType(msg.message);
 
-      const ext = mimeTypes.extension(mediaMessage?.['mimetype']);
-      const fileName = mediaMessage?.['fileName'] || `${msg.key.id}.${ext}` || `${v4()}.${ext}`;
+      const ext = mimeTypes.extension(mediaMessage?.['mimetype']) || 'bin';
+      const fileName = mediaMessage?.['fileName'] || `${msg.key.id}.${ext}` || `file_${Date.now()}.${ext}`;
 
       if (convertToMp4 && typeMessage === 'audioMessage') {
         try {
