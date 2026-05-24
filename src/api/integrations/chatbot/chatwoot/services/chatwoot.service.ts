@@ -3964,31 +3964,57 @@ export class ChatwootService {
         for (const contactData of contacts) {
           try {
             const remoteJid = contactData.remoteJid;
+            const remoteJidAlt = contactData.remoteJidAlt;
             const profilePicUrl = contactData.profilePicUrl;
 
-            this.logger.log(`📸 Processando contato: ${remoteJid} | Foto: ${profilePicUrl}`);
+            this.logger.log(`📸 Processando contato: ${remoteJid} | Alt: ${remoteJidAlt} | Foto: ${profilePicUrl}`);
 
             if (!remoteJid || !profilePicUrl) {
               this.logger.warn(`⚠️ Contato sem foto ou JID invalido: ${remoteJid}`);
               continue;
             }
 
-            // Busca o contato no Chatwoot
-            const chatId = remoteJid.split('@')[0].split(':')[0];
-            this.logger.log(`📸 Buscando contato ${chatId} no Chatwoot...`);
-            const contact = await this.findContact(instance, chatId);
+            // 🔍 BUSCA INTELIGENTE: Tenta encontrar o contato de várias formas
+            // Porque @lid e número podem vir invertidos em remoteJid/remoteJidAlt
+            let contact = null;
+            const jidsToTry = [];
+
+            // Coleta todos os JIDs possíveis (sem duplicatas)
+            if (remoteJid) jidsToTry.push(remoteJid);
+            if (remoteJidAlt && remoteJidAlt !== remoteJid) jidsToTry.push(remoteJidAlt);
+
+            this.logger.log(
+              `📸 Tentando buscar contato com ${jidsToTry.length} identificadores: ${jidsToTry.join(', ')}`,
+            );
+
+            // Tenta buscar com cada JID até encontrar
+            for (const jid of jidsToTry) {
+              const chatId = jid.split('@')[0].split(':')[0];
+              this.logger.log(`📸 Tentativa de busca com: ${chatId} (de ${jid})`);
+
+              contact = await this.findContact(instance, chatId);
+
+              if (contact) {
+                this.logger.log(`✅ Contato encontrado com ${chatId}!`);
+                break;
+              } else {
+                this.logger.log(`⚠️ Não encontrado com ${chatId}, tentando próximo...`);
+              }
+            }
 
             if (contact) {
               this.logger.log(`📸 Contato encontrado! ID: ${contact.id} | Nome: ${contact.name}`);
-              this.logger.log(`📸 Atualizando foto do contato ${chatId} no Chatwoot com URL: ${profilePicUrl}`);
+              this.logger.log(`📸 Atualizando foto do contato no Chatwoot com URL: ${profilePicUrl}`);
 
               await this.updateContact(instance, contact.id, {
                 avatar_url: profilePicUrl,
               });
 
-              this.logger.log(`✅ Foto atualizada com sucesso para ${chatId}`);
+              this.logger.log(`✅ Foto atualizada com sucesso para contato ID ${contact.id}`);
             } else {
-              this.logger.warn(`⚠️ Contato ${chatId} nao encontrado no Chatwoot`);
+              this.logger.warn(
+                `⚠️ Contato não encontrado no Chatwoot após tentar todos os identificadores: ${jidsToTry.join(', ')}`,
+              );
             }
           } catch (error) {
             this.logger.error(`❌ Erro ao atualizar foto do contato: ${error.message}`);
