@@ -3209,11 +3209,55 @@ export class ChatwootService {
           return;
         }
 
-        // 🔧 FIX: Ignora protocolMessage (edições/revogações) - serão tratadas pelos eventos específicos
+        // 🔧 FIX: Processa protocolMessage de edição diretamente se o evento messages.edit não vier
         if (body.message?.protocolMessage) {
+          const protocolType = body.message.protocolMessage.type;
+
           this.logger.verbose(
-            '[messages.upsert] Ignorando protocolMessage - será tratado por messages.edit ou messages.delete',
+            `[messages.upsert] protocolMessage detectado - Type: ${protocolType} | Key: ${body.key.id}`,
           );
+
+          // Se for edição (type 14 = MESSAGE_EDIT), processa aqui como fallback
+          if (protocolType === 14) {
+            const editedMessageContentRaw =
+              body.message.protocolMessage.editedMessage?.conversation ??
+              body.message.protocolMessage.editedMessage?.extendedTextMessage?.text ??
+              body.message.protocolMessage.editedMessage?.imageMessage?.caption ??
+              body.message.protocolMessage.editedMessage?.videoMessage?.caption ??
+              body.message.protocolMessage.editedMessage?.documentMessage?.caption;
+
+            const editedMessageContent = (editedMessageContentRaw ?? '').trim();
+
+            if (editedMessageContent) {
+              this.logger.info(
+                `[messages.upsert] Processando edição via protocolMessage (fallback) - Content: ${editedMessageContent}`,
+              );
+
+              const message = await this.getMessageByKeyId(instance, body.message.protocolMessage.key.id);
+              if (message && message.chatwootConversationId) {
+                const key = message.key as WAMessageKey;
+                const messageType = key?.fromMe ? 'outgoing' : 'incoming';
+                const label = `\`${i18next.t('cw.message.edited')}:\``;
+                const editedText = `${label} ${editedMessageContent}`;
+
+                await this.createMessage(
+                  instance,
+                  message.chatwootConversationId,
+                  editedText,
+                  messageType,
+                  false,
+                  [],
+                  { message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } } },
+                  'WAID:' + body.message.protocolMessage.key.id,
+                  null,
+                );
+
+                this.logger.info('[messages.upsert] Edição processada com sucesso via protocolMessage');
+              }
+            }
+          }
+
+          // Ignora o protocolMessage após processar (se necessário)
           return;
         }
 
