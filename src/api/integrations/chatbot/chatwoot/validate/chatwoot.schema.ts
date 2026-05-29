@@ -40,6 +40,19 @@ export const chatwootSchema: JSONSchema7 = {
     daysLimitImportMessages: { type: 'number' },
     ignoreJids: { type: 'array', items: { type: 'string' } },
   },
-  required: ['enabled', 'accountId', 'token', 'url', 'signMsg', 'reopenConversation', 'conversationPending'],
-  ...isNotEmpty('enabled', 'accountId', 'token', 'url', 'signMsg', 'reopenConversation', 'conversationPending'),
+  required: ['enabled'],
+  allOf: [
+    {
+      if: {
+        properties: {
+          enabled: { enum: [true] },
+        },
+        required: ['enabled'],
+      },
+      then: {
+        required: ['accountId', 'token', 'url', 'signMsg', 'reopenConversation', 'conversationPending'],
+        ...isNotEmpty('accountId', 'token', 'url'),
+      },
+    },
+  ],
 };

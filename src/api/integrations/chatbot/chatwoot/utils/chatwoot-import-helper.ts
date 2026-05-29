@@ -471,7 +471,7 @@ class ChatwootImport {
       this.deleteHistoryMessages(instance);
       this.deleteRepositoryMessagesCache(instance);
 
-      return 0; // Retorna 0 em caso de erro
+      throw error;
     }
   }
 

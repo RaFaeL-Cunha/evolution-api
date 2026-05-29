@@ -355,6 +355,8 @@ export class ChatwootService {
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
 
+  private readonly syncLostMessagesLocks = new Set<string>();
+
   private provider: any;
 
   constructor(
@@ -3196,14 +3198,6 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
-        // ⏱️ Marca tempo de início do processamento
-        const startTime = Date.now();
-        const messageTimestamp = body.messageTimestamp ? body.messageTimestamp * 1000 : Date.now();
-        const receiveDelay = startTime - messageTimestamp;
-
-        this.logger.log(
-          `⏱️ [PERF] Mensagem recebida - ID: ${body.key.id} | Delay recebimento: ${receiveDelay}ms | Timestamp msg: ${new Date(messageTimestamp).toISOString()}`,
-        );
         this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
         if (body.key.remoteJid === 'status@broadcast') {
           return;
@@ -3321,11 +3315,6 @@ export class ChatwootService {
 
         const getConversation = await this.createConversation(instance, body);
 
-        const conversationTime = Date.now();
-        this.logger.log(
-          `⏱️ [PERF] Conversa criada/encontrada - ID: ${body.key.id} | Tempo: ${conversationTime - startTime}ms`,
-        );
-
         if (!getConversation) {
           this.logger.warn(
             `conversation not found - remoteJid: ${body.key.remoteJid}, addressingMode: ${body.key.addressingMode}, remoteJidAlt: ${body.key.remoteJidAlt}`,
@@ -3401,12 +3390,6 @@ export class ChatwootService {
               quotedMsg,
             );
 
-            const sendTime = Date.now();
-            const totalTime = sendTime - startTime;
-            this.logger.log(
-              `⏱️ [PERF] Mensagem MIDIA enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
-            );
-
             if (!send) {
               this.logger.warn('message not sent');
               return;
@@ -3431,12 +3414,6 @@ export class ChatwootService {
               body,
               'WAID:' + body.key.id,
               quotedMsg,
-            );
-
-            const sendTime = Date.now();
-            const totalTime = sendTime - startTime;
-            this.logger.log(
-              `⏱️ [PERF] Mensagem MIDIA enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
             );
 
             if (!send) {
@@ -3679,12 +3656,6 @@ export class ChatwootService {
             quotedMsg,
           );
 
-          const sendTime = Date.now();
-          const totalTime = sendTime - startTime;
-          this.logger.log(
-            `⏱️ [PERF] Mensagem GRUPO enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
-          );
-
           if (!send) {
             this.logger.warn('message not sent');
             return;
@@ -3709,12 +3680,6 @@ export class ChatwootService {
             body,
             'WAID:' + body.key.id,
             quotedMsg,
-          );
-
-          const sendTime = Date.now();
-          const totalTime = sendTime - startTime;
-          this.logger.log(
-            `⏱️ [PERF] Mensagem TEXTO enviada ao Chatwoot - ID: ${body.key.id} | Tempo envio: ${sendTime - conversationTime}ms | Tempo total: ${totalTime}ms`,
           );
 
           if (!send) {
@@ -3987,11 +3952,12 @@ export class ChatwootService {
             // 🔍 BUSCA INTELIGENTE: Tenta encontrar o contato de várias formas
             // Porque @lid e número podem vir invertidos em remoteJid/remoteJidAlt
             let contact = null;
-            const jidsToTry = [];
-
-            // Coleta todos os JIDs possíveis (sem duplicatas)
-            if (remoteJid) jidsToTry.push(remoteJid);
-            if (remoteJidAlt && remoteJidAlt !== remoteJid) jidsToTry.push(remoteJidAlt);
+            const possibleJids = [remoteJid, remoteJidAlt].filter(Boolean) as string[];
+            const uniqueJids = Array.from(new Set(possibleJids));
+            const jidsToTry = [
+              ...uniqueJids.filter((jid) => !jid.includes('@lid')),
+              ...uniqueJids.filter((jid) => jid.includes('@lid')),
+            ];
 
             this.logger.log(
               `📸 Tentando buscar contato com ${jidsToTry.length} identificadores: ${jidsToTry.join(', ')}`,
@@ -4090,25 +4056,31 @@ export class ChatwootService {
       return;
     }
 
-    this.createBotMessage(instance, i18next.t('cw.import.importingMessages'), 'incoming');
+    try {
+      this.createBotMessage(instance, i18next.t('cw.import.importingMessages'), 'incoming');
 
-    const totalMessagesImported = await chatwootImport.importHistoryMessages(
-      instance,
-      this,
-      await this.getInbox(instance),
-      this.provider,
-      true, // 🔧 Mostra mensagens do bot ao conectar (QR Code)
-      this.prismaRepository, // 🔧 Para converter LIDs
-    );
-    this.updateContactAvatarInRecentConversations(instance);
+      const totalMessagesImported = await chatwootImport.importHistoryMessages(
+        instance,
+        this,
+        await this.getInbox(instance),
+        this.provider,
+        true, // 🔧 Mostra mensagens do bot ao conectar (QR Code)
+        this.prismaRepository, // 🔧 Para converter LIDs
+      );
+      this.updateContactAvatarInRecentConversations(instance);
 
-    const msg = Number.isInteger(totalMessagesImported)
-      ? i18next.t('cw.import.messagesImported', { totalMessagesImported })
-      : i18next.t('cw.import.messagesException');
+      const msg = Number.isInteger(totalMessagesImported)
+        ? i18next.t('cw.import.messagesImported', { totalMessagesImported })
+        : i18next.t('cw.import.messagesException');
 
-    this.createBotMessage(instance, msg, 'incoming');
+      this.createBotMessage(instance, msg, 'incoming');
 
-    return totalMessagesImported;
+      return totalMessagesImported;
+    } catch (error) {
+      this.logger.error(`[importHistoryMessages] Erro: ${error.message}`);
+      this.createBotMessage(instance, i18next.t('cw.import.messagesException'), 'incoming');
+      return null;
+    }
   }
 
   public async updateContactAvatarInRecentConversations(instance: InstanceDto, limitContacts = 100) {
@@ -4174,6 +4146,15 @@ export class ChatwootService {
     chatwootConfig: ChatwootDto,
     prepareMessage: (message: any) => any,
   ) {
+    const lockKey = instance.instanceName;
+    if (this.syncLostMessagesLocks.has(lockKey)) {
+      const message = `Sincronização já em andamento para ${instance.instanceName}`;
+      this.logger.warn(`[syncLostMessages] ${message}`);
+      throw new Error(message);
+    }
+
+    this.syncLostMessagesLocks.add(lockKey);
+
     try {
       this.logger.log(`[syncLostMessages] Iniciando sincronização para ${instance.instanceName}`);
 
@@ -4290,6 +4271,8 @@ export class ChatwootService {
     } catch (error) {
       this.logger.error(`[syncLostMessages] Erro: ${error.message}`);
       throw error; // Lança erro para o comando /lost tratar
+    } finally {
+      this.syncLostMessagesLocks.delete(lockKey);
     }
   }
 }
