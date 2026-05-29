@@ -3253,11 +3253,21 @@ export class ChatwootService {
                 );
 
                 this.logger.info('[messages.upsert] Edição processada com sucesso via protocolMessage');
+              } else {
+                this.logger.warn('[messages.upsert] Mensagem original não encontrada para edição via protocolMessage');
               }
+            } else {
+              this.logger.warn('[messages.upsert] Conteúdo editado vazio - ignorando protocolMessage de edição');
             }
+
+            // Encerra o fluxo após tratar uma protocolMessage de edição.
+            return;
           }
 
-          // Ignora o protocolMessage após processar (se necessário)
+          // Ignora protocolMessage que não é edição.
+          this.logger.verbose(
+            `[messages.upsert] protocolMessage type ${protocolType} ignorado - encerrando processamento`,
+          );
           return;
         }
 

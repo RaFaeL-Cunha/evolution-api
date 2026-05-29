@@ -686,8 +686,8 @@ export class BusinessStartupService extends ChannelStartupService {
 
           if (chatwootSentMessage?.id) {
             messageRaw.chatwootMessageId = chatwootSentMessage.id;
-            messageRaw.chatwootInboxId = chatwootSentMessage.id;
-            messageRaw.chatwootConversationId = chatwootSentMessage.id;
+            messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
+            messageRaw.chatwootConversationId = chatwootSentMessage.conversation_id;
           }
         }
 
