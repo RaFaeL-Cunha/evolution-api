@@ -133,6 +133,7 @@ import { Label } from 'baileys/lib/Types/Label';
 import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
+import { createDecipheriv, hkdfSync } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
@@ -985,6 +986,278 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  private normalizeEditedMessageContent(message: any): any {
+    if (!message) return null;
+
+    return (
+      message?.message?.protocolMessage?.editedMessage ??
+      message?.protocolMessage?.editedMessage ??
+      message?.message?.editedMessage ??
+      message?.editedMessage ??
+      message?.message ??
+      message
+    );
+  }
+
+  private extractEditedMessageText(message: any): string | null {
+    const content = this.normalizeEditedMessageContent(message);
+
+    const text =
+      content?.conversation ??
+      content?.extendedTextMessage?.text ??
+      content?.imageMessage?.caption ??
+      content?.videoMessage?.caption ??
+      content?.documentMessage?.caption ??
+      content?.documentWithCaptionMessage?.message?.documentMessage?.caption ??
+      null;
+
+    return typeof text === 'string' && text.trim().length > 0 ? text.trim() : null;
+  }
+
+  private isSecretEncryptedEditMessage(message: any): boolean {
+    const secretEncryptedMessage = message?.message?.secretEncryptedMessage ?? message?.secretEncryptedMessage;
+
+    return (
+      !!secretEncryptedMessage?.targetMessageKey &&
+      secretEncryptedMessage?.secretEncType === proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT
+    );
+  }
+
+  private getBinaryMessageSecret(messageSecret: any): Buffer | null {
+    if (!messageSecret) return null;
+
+    if (Buffer.isBuffer(messageSecret)) return messageSecret;
+    if (messageSecret instanceof Uint8Array) return Buffer.from(messageSecret);
+    if (Array.isArray(messageSecret)) return Buffer.from(messageSecret);
+
+    if (typeof messageSecret === 'string') {
+      return Buffer.from(messageSecret, 'base64');
+    }
+
+    if (typeof messageSecret === 'object') {
+      const keys = Object.keys(messageSecret);
+      const isIndexedObject = keys.length > 0 && keys.every((key) => !Number.isNaN(Number(key)));
+
+      if (isIndexedObject) {
+        return Buffer.from(keys.sort((a, b) => Number(a) - Number(b)).map((key) => messageSecret[key]));
+      }
+    }
+
+    return null;
+  }
+
+  private generateMsgSecretKey(
+    modificationType: string,
+    origMsgId: string,
+    origMsgSender: string,
+    modificationSender: string,
+    origMsgSecret: Buffer,
+    salt = Buffer.alloc(0),
+  ): Buffer {
+    const useCaseSecret = Buffer.concat([
+      Buffer.from(origMsgId),
+      Buffer.from(origMsgSender),
+      Buffer.from(modificationSender),
+      Buffer.from(modificationType),
+    ]);
+
+    return Buffer.from(hkdfSync('sha256', origMsgSecret, salt, useCaseSecret, 32));
+  }
+
+  private aesDecryptGCM(ciphertext: Buffer, key: Buffer, iv: Buffer, additionalData = Buffer.alloc(0)): Buffer {
+    const tagLength = 16;
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    const encrypted = ciphertext.subarray(0, ciphertext.length - tagLength);
+    const tag = ciphertext.subarray(ciphertext.length - tagLength);
+
+    decipher.setAAD(additionalData);
+    decipher.setAuthTag(tag);
+
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  }
+
+  private normalizeSecretJid(jid?: string | null) {
+    if (!jid) return '';
+
+    const [user, server] = jid.split('@');
+    if (!server) return jid;
+
+    return `${user.split(':')[0]}@${server === 'c.us' ? 's.whatsapp.net' : server}`;
+  }
+
+  private areSameSecretUser(jidA?: string | null, jidB?: string | null) {
+    if (!jidA || !jidB) return false;
+
+    return jidA.split('@')[0].split(':')[0] === jidB.split('@')[0].split(':')[0];
+  }
+
+  private getOwnSecretJids() {
+    const creds: any = this.client?.authState?.creds?.me;
+    const clientUser: any = this.client?.user;
+
+    const meId = this.normalizeSecretJid(
+      clientUser?.id?.includes('@lid') ? null : clientUser?.id || creds?.id || this.instance?.wuid || null,
+    );
+    const meLid = this.normalizeSecretJid(clientUser?.lid || creds?.lid || null);
+
+    return { meId, meLid };
+  }
+
+  private getOwnSecretJid(addressingMode?: string | null) {
+    const { meId, meLid } = this.getOwnSecretJids();
+
+    return addressingMode === 'lid' && meLid ? meLid : meId;
+  }
+
+  private getSecretMessageSender(key: any, fallbackJid?: string) {
+    if (key?.fromMe) return this.getOwnSecretJid(key?.addressingMode);
+
+    return this.normalizeSecretJid(key?.participant || fallbackJid || key?.remoteJid);
+  }
+
+  private getSecretMessageSenderCandidates(key: any, fallbackJid?: string) {
+    if (key?.fromMe) return [this.getOwnSecretJid(key?.addressingMode)].filter(Boolean);
+
+    const candidates = [key?.participant, fallbackJid, key?.remoteJid, key?.participantAlt, key?.remoteJidAlt].map(
+      (jid) => this.normalizeSecretJid(jid),
+    );
+
+    return [...new Set(candidates.filter(Boolean))];
+  }
+
+  private normalizeSecretEncryptedTargetKey(messageKey: any, targetMessageKey: any) {
+    if (messageKey?.fromMe) return;
+
+    const { meId, meLid } = this.getOwnSecretJids();
+    const targetSender = targetMessageKey?.participant || targetMessageKey?.remoteJid;
+
+    targetMessageKey.fromMe = !targetMessageKey?.fromMe
+      ? this.areSameSecretUser(targetSender, meId) || this.areSameSecretUser(targetSender, meLid)
+      : false;
+    targetMessageKey.remoteJid = messageKey?.remoteJid;
+    targetMessageKey.participant = targetMessageKey?.participant || messageKey?.participant;
+    targetMessageKey.remoteJidAlt = messageKey?.remoteJidAlt;
+    targetMessageKey.participantAlt = targetMessageKey?.participantAlt || messageKey?.participantAlt;
+  }
+
+  private async decryptSecretEncryptedEditMessage(message: proto.IWebMessageInfo): Promise<boolean> {
+    const secretEncryptedMessage: any = message?.message?.secretEncryptedMessage;
+    const targetMessageKey: any = secretEncryptedMessage?.targetMessageKey;
+
+    if (
+      !targetMessageKey?.id ||
+      !secretEncryptedMessage?.encPayload?.length ||
+      !secretEncryptedMessage?.encIv?.length
+    ) {
+      return false;
+    }
+
+    this.normalizeSecretEncryptedTargetKey(message.key, targetMessageKey);
+
+    const originalMessage: any = await this.getMessage(targetMessageKey);
+    const messageSecret = this.getBinaryMessageSecret(originalMessage?.messageContextInfo?.messageSecret);
+
+    if (!messageSecret?.length) {
+      this.logger.warn(`[CW.EDIT] messageSecret não encontrado para descriptografar edição ${targetMessageKey.id}`);
+      return false;
+    }
+
+    const originalSender = this.getSecretMessageSender(
+      targetMessageKey,
+      targetMessageKey.participant || targetMessageKey.remoteJid,
+    );
+    const modificationSender = this.getSecretMessageSender(
+      message.key,
+      message.key.participant || message.key.remoteJid,
+    );
+    const originalSenderCandidates = this.getSecretMessageSenderCandidates(
+      targetMessageKey,
+      targetMessageKey.participant || targetMessageKey.remoteJid,
+    );
+    const modificationSenderCandidates = this.getSecretMessageSenderCandidates(
+      message.key,
+      message.key.participant || message.key.remoteJid,
+    );
+
+    if (!originalSender || !modificationSender) {
+      this.logger.warn(`[CW.EDIT] remetente ausente para descriptografar edição ${targetMessageKey.id}`);
+      return false;
+    }
+
+    try {
+      const encryptedPayload = Buffer.from(secretEncryptedMessage.encPayload);
+      const encryptedIv = Buffer.from(secretEncryptedMessage.encIv);
+      const saltCandidates = [Buffer.alloc(0), Buffer.alloc(32)];
+      let decryptedMessage: proto.IMessage | null = null;
+      let decryptError: any;
+      let decryptStrategy = '';
+
+      for (const originalSenderCandidate of originalSenderCandidates) {
+        for (const modificationSenderCandidate of modificationSenderCandidates) {
+          const aadCandidates = [
+            Buffer.alloc(0),
+            Buffer.from(`${targetMessageKey.id}\u0000${modificationSenderCandidate}`),
+          ];
+
+          for (const saltCandidate of saltCandidates) {
+            for (const additionalData of aadCandidates) {
+              try {
+                const decryptKey = this.generateMsgSecretKey(
+                  'Message Edit',
+                  targetMessageKey.id,
+                  originalSenderCandidate,
+                  modificationSenderCandidate,
+                  messageSecret,
+                  saltCandidate,
+                );
+                const decrypted = this.aesDecryptGCM(encryptedPayload, decryptKey, encryptedIv, additionalData);
+
+                decryptedMessage = proto.Message.decode(decrypted);
+                decryptStrategy = `salt:${saltCandidate.length}|aad:${additionalData.length}|orig:${originalSenderCandidate}|mod:${modificationSenderCandidate}`;
+                break;
+              } catch (error) {
+                decryptError = error;
+              }
+            }
+            if (decryptedMessage) break;
+          }
+          if (decryptedMessage) break;
+        }
+        if (decryptedMessage) break;
+      }
+
+      if (!decryptedMessage) {
+        throw decryptError;
+      }
+
+      if (message.message?.messageContextInfo && !decryptedMessage.messageContextInfo) {
+        decryptedMessage.messageContextInfo = message.message.messageContextInfo;
+      }
+
+      message.message = {
+        protocolMessage: {
+          key: targetMessageKey,
+          type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
+          editedMessage: decryptedMessage,
+          timestampMs: Number(message.messageTimestamp ?? Math.floor(Date.now() / 1000)) * 1000,
+        },
+      };
+
+      this.logger.info(
+        `[CW.EDIT] Edição criptografada descriptografada com sucesso - target: ${targetMessageKey.id} (${decryptStrategy})`,
+      );
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `[CW.EDIT] Falha ao descriptografar edição criptografada ${targetMessageKey.id}: ${error?.message ?? error} - originalSender=${originalSender} modificationSender=${modificationSender} originalCandidates=${originalSenderCandidates.length} modificationCandidates=${modificationSenderCandidates.length} messageSecret=${messageSecret.length} encPayload=${secretEncryptedMessage.encPayload.length} encIv=${secretEncryptedMessage.encIv.length}`,
+      );
+      return false;
+    }
+  }
+
+  private readonly encryptedEditMessageText =
+    '🔐 Edição criptografada\n\nA mensagem foi editada, mas a edição veio criptografada e não pôde ser descriptografada pela API. Verifique no celular para visualizar a edição.';
+
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
@@ -1260,8 +1533,34 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
           //  EDIT/DELETE (Baileys) sem duplicação e sem texto no WhatsApp
-          const protocolMsg: any =
+          let protocolMsg: any =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+
+          if (this.isSecretEncryptedEditMessage(received)) {
+            const targetMessageKey = received.message?.secretEncryptedMessage?.targetMessageKey;
+            const decrypted = await this.decryptSecretEncryptedEditMessage(received);
+
+            if (decrypted) {
+              protocolMsg = received?.message?.protocolMessage;
+            } else {
+              this.logger.info(
+                `[CW.EDIT] Edição criptografada sem payload descriptografado - target: ${targetMessageKey?.id}`,
+              );
+
+              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                await this.chatwootService.eventWhatsapp(
+                  'messages.edit',
+                  { instanceName: this.instance.name, instanceId: this.instance.id },
+                  {
+                    key: targetMessageKey ?? received.key,
+                    text: this.encryptedEditMessageText,
+                  },
+                );
+              }
+
+              continue;
+            }
+          }
 
           const isStubRevoke = received?.messageStubType === proto.WebMessageInfo.StubType.REVOKE;
 
@@ -1333,7 +1632,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           // EDIT (somente quando NÃO for REVOKE)
-          if (protocolMsg && protocolMsg.type !== proto.Message.ProtocolMessage.Type.REVOKE) {
+          if (protocolMsg?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
             const payloadToProcess: any = protocolMsg;
             const keyToSearch: any = payloadToProcess?.key ?? received?.key;
 
@@ -1343,7 +1642,9 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             // conteúdo de edição (WhatsApp não recebe placeholder)
-            const messageContentUpdate: any = (payloadToProcess as any)?.editedMessage || { conversation: '' };
+            const messageContentUpdate: any = this.normalizeEditedMessageContent(
+              (payloadToProcess as any)?.editedMessage,
+            ) || { conversation: '' };
             const status = 'EDITED';
             const webhookEvent = Events.MESSAGES_EDITED;
 
@@ -1352,17 +1653,11 @@ export class BaileysStartupService extends ChannelStartupService {
               const chatwootPayload: any = {
                 ...payloadToProcess,
                 key: keyToSearch,
-                editedMessage: (payloadToProcess as any)?.editedMessage ?? messageContentUpdate,
+                editedMessage: messageContentUpdate,
               };
 
               const friendlyText =
-                messageContentUpdate?.conversation ??
-                messageContentUpdate?.extendedTextMessage?.text ??
-                messageContentUpdate?.imageMessage?.caption ??
-                messageContentUpdate?.videoMessage?.caption ??
-                messageContentUpdate?.documentMessage?.caption ??
-                (payloadToProcess as any)?.text ??
-                '';
+                this.extractEditedMessageText(messageContentUpdate) ?? (payloadToProcess as any)?.text ?? '';
 
               if (friendlyText) {
                 chatwootPayload.text = friendlyText;
@@ -2089,6 +2384,58 @@ export class BaileysStartupService extends ChannelStartupService {
               continue;
             }
             message.messageId = findMessage.id;
+
+            const editedMessageContent = this.normalizeEditedMessageContent(update.message);
+            const editedMessageText = this.extractEditedMessageText(editedMessageContent);
+
+            if (editedMessageContent && update.message?.editedMessage) {
+              const editedPayload = {
+                key,
+                editedMessage: editedMessageContent,
+                text: editedMessageText,
+              };
+
+              this.sendDataWebhook(Events.MESSAGES_EDITED, editedPayload);
+
+              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                await this.chatwootService.eventWhatsapp(
+                  'messages.edit',
+                  {
+                    instanceName: this.instance.name,
+                    instanceId: this.instanceId,
+                  },
+                  editedPayload,
+                );
+              }
+
+              const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
+                ? Math.floor((update.messageTimestamp as Long).toNumber())
+                : Math.floor((update.messageTimestamp as number) ?? Date.now() / 1000);
+
+              await this.prismaRepository.message.update({
+                where: { id: findMessage.id },
+                data: {
+                  message: editedMessageContent,
+                  messageTimestamp: editedMessageTimestamp,
+                  status: 'EDITED',
+                },
+              });
+
+              if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+                await this.prismaRepository.messageUpdate.create({
+                  data: {
+                    fromMe: key.fromMe ?? false,
+                    keyId: key.id ?? '',
+                    remoteJid: key.remoteJid ?? '',
+                    status: 'EDITED',
+                    instanceId: this.instanceId,
+                    messageId: findMessage.id,
+                  },
+                });
+              }
+
+              continue;
+            }
 
             // 🔧 FIX PR #2427: Fallback para mensagens de áudio que não tiveram MESSAGES_UPSERT emitido
             // Algumas mensagens de áudio podem ter o update antes do upsert devido a timing
@@ -5542,6 +5889,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
+    if (message.message?.deviceSentMessage?.message?.messageContextInfo) {
+      message.message.messageContextInfo = message.message.deviceSentMessage.message.messageContextInfo;
+    }
+
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
 

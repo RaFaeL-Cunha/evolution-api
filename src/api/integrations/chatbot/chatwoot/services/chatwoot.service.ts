@@ -2780,6 +2780,43 @@ export class ChatwootService {
     return types;
   }
 
+  private normalizeEditedMessageContent(message: any): any {
+    if (!message) return null;
+
+    return (
+      message?.message?.protocolMessage?.editedMessage ??
+      message?.protocolMessage?.editedMessage ??
+      message?.message?.editedMessage ??
+      message?.editedMessage ??
+      message?.message ??
+      message
+    );
+  }
+
+  private extractEditedMessageText(message: any): string | null {
+    const content = this.normalizeEditedMessageContent(message);
+
+    const text =
+      content?.conversation ??
+      content?.extendedTextMessage?.text ??
+      content?.imageMessage?.caption ??
+      content?.videoMessage?.caption ??
+      content?.documentMessage?.caption ??
+      content?.documentWithCaptionMessage?.message?.documentMessage?.caption ??
+      null;
+
+    return typeof text === 'string' && text.trim().length > 0 ? text.trim() : null;
+  }
+
+  private isSecretEncryptedEditMessage(message: any): boolean {
+    const secretEncryptedMessage = message?.message?.secretEncryptedMessage ?? message?.secretEncryptedMessage;
+
+    return !!secretEncryptedMessage?.targetMessageKey && secretEncryptedMessage?.secretEncType === 2;
+  }
+
+  private readonly encryptedEditMessageText =
+    '🔐 Edição criptografada\n\nA mensagem foi editada, mas a edição veio criptografada e não pôde ser descriptografada pela API. Verifique no celular para visualizar a edição.';
+
   private getMessageContent(types: any) {
     // Ignora messageContextInfo pois é apenas metadado - busca o tipo real da mensagem
     const typeKey = Object.keys(types).find((key) => key !== 'messageContextInfo' && types[key] !== undefined);
@@ -2793,6 +2830,10 @@ export class ChatwootService {
 
     if (typeKey === 'viewOnceMessageV2') {
       return '🔒 *Mensagem de visualização única*\n\n_Esta mensagem só pode ser visualizada uma vez no celular. Por segurança, o WhatsApp não permite que ela seja acessada pela API._';
+    }
+
+    if (typeKey === 'secretEncryptedMessage' && this.isSecretEncryptedEditMessage({ secretEncryptedMessage: result })) {
+      return null;
     }
 
     if (typeKey === 'secretEncryptedMessage') {
@@ -3198,10 +3239,24 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
-        this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
         if (body.key.remoteJid === 'status@broadcast') {
           return;
         }
+
+        if (this.isSecretEncryptedEditMessage(body)) {
+          this.logger.info(
+            `[${event}] Edição criptografada sem payload descriptografado - target: ${body.message?.secretEncryptedMessage?.targetMessageKey?.id}`,
+          );
+
+          await this.eventWhatsapp('messages.edit', instance, {
+            key: body.message?.secretEncryptedMessage?.targetMessageKey ?? body.key,
+            text: this.encryptedEditMessageText,
+          });
+
+          return;
+        }
+
+        this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
 
         // 🔧 FIX: Processa protocolMessage de edição diretamente se o evento messages.edit não vier
         if (body.message?.protocolMessage) {
@@ -3213,14 +3268,7 @@ export class ChatwootService {
 
           // Se for edição (type 14 = MESSAGE_EDIT), processa aqui como fallback
           if (protocolType === 14) {
-            const editedMessageContentRaw =
-              body.message.protocolMessage.editedMessage?.conversation ??
-              body.message.protocolMessage.editedMessage?.extendedTextMessage?.text ??
-              body.message.protocolMessage.editedMessage?.imageMessage?.caption ??
-              body.message.protocolMessage.editedMessage?.videoMessage?.caption ??
-              body.message.protocolMessage.editedMessage?.documentMessage?.caption;
-
-            const editedMessageContent = (editedMessageContentRaw ?? '').trim();
+            const editedMessageContent = this.extractEditedMessageText(body.message.protocolMessage);
 
             if (editedMessageContent) {
               this.logger.info(
@@ -3764,15 +3812,8 @@ export class ChatwootService {
       // Cria "Mensagem editada: <texto>" SOMENTE se houver texto (evita 'undefined')
       // Se vier "edit" sem texto (REVOKE mascarado), não faz nada aqui — o bloco de DELETE trata.
       if (event === 'messages.edit' || event === 'send.message.update') {
-        const editedMessageContentRaw =
-          body?.editedMessage?.conversation ??
-          body?.editedMessage?.extendedTextMessage?.text ??
-          body?.editedMessage?.imageMessage?.caption ??
-          body?.editedMessage?.videoMessage?.caption ??
-          body?.editedMessage?.documentMessage?.caption ??
-          (typeof body?.text === 'string' ? body.text : undefined);
-
-        const editedMessageContent = (editedMessageContentRaw ?? '').trim();
+        const editedMessageContent =
+          this.extractEditedMessageText(body) ?? (typeof body?.text === 'string' ? body.text.trim() : '');
 
         // Sem conteúdo? Ignora aqui. O DELETE vai gerar o placeholder se for o caso.
         if (!editedMessageContent) {
@@ -4212,6 +4253,10 @@ export class ChatwootService {
 
         // Ignora mensagens de álbum (metadados) - as mídias reais já são importadas via imageMessage/videoMessage
         if (msg.message?.albumMessage || msg.message?.associatedChildMessage) {
+          return false;
+        }
+
+        if (this.isSecretEncryptedEditMessage(msg.message)) {
           return false;
         }
 
