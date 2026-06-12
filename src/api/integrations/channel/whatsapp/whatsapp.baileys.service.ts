@@ -226,6 +226,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
   private preKeyErrorTracker = new Map<string, { count: number; lastError: number }>(); // Track PreKey errors by contact
   private failedMessages = new Map<string, Array<{ message: any; timestamp: number; attempts: number }>>(); // Store failed messages by contact
+  private loggedDecryptionErrorIds = new Map<string, number>(); // Avoid noisy duplicate decryption logs
   private profilePictureCache = new Map<string, { url: string | null; timestamp: number }>(); // Cache de fotos de perfil
 
   constructor(
@@ -2232,8 +2233,9 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (contact) {
+            const isGroupContact = contactRaw.remoteJid.includes('@g.us');
             // ✅ Só envia evento CONTACTS_UPDATE se a foto realmente mudou
-            if (this.hasProfilePictureChanged(contactRaw.remoteJid, contactRaw.profilePicUrl)) {
+            if (!isGroupContact && this.hasProfilePictureChanged(contactRaw.remoteJid, contactRaw.profilePicUrl)) {
               this.logger.log(
                 `📸 [Baileys] Foto mudou para ${contactRaw.remoteJid} - Disparando evento CONTACTS_UPDATE`,
               );
@@ -2573,14 +2575,41 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.GROUPS_UPSERT, groupMetadata);
     },
 
-    'groups.update': (groupMetadataUpdate: Partial<GroupMetadata>[]) => {
+    'groups.update': async (groupMetadataUpdate: Partial<GroupMetadata>[]) => {
       this.sendDataWebhook(Events.GROUPS_UPDATE, groupMetadataUpdate);
 
-      groupMetadataUpdate.forEach((group) => {
-        if (isJidGroup(group.id)) {
-          this.updateGroupMetadataCache(group.id);
+      for (const group of groupMetadataUpdate) {
+        if (!isJidGroup(group.id)) {
+          continue;
         }
-      });
+
+        this.updateGroupMetadataCache(group.id);
+
+        const profilePicUrl = (await this.profilePicture(group.id)).profilePictureUrl;
+        if (this.hasProfilePictureChanged(group.id, profilePicUrl)) {
+          const contactRaw = {
+            remoteJid: group.id,
+            pushName: group.subject || '',
+            profilePicUrl,
+            instanceId: this.instanceId,
+          };
+
+          this.logger.log(`📸 [Baileys] Foto do grupo mudou para ${group.id} - Disparando evento CONTACTS_UPDATE`);
+          this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
+
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            this.logger.log(`📸 [Baileys] Enviando atualização de foto do grupo para Chatwoot...`);
+            await this.chatwootService.eventWhatsapp(
+              Events.CONTACTS_UPDATE,
+              {
+                instanceName: this.instance.name,
+                instanceId: this.instanceId,
+              },
+              contactRaw,
+            );
+          }
+        }
+      }
     },
 
     'group-participants.update': async (participantsUpdate: {
@@ -2798,17 +2827,20 @@ export class BaileysStartupService extends ChannelStartupService {
                     ].some((err) => param?.includes?.(err)),
                   )
                 ) {
-                  this.logger.warn(
-                    `Mensagem filtrada devido a erro de descriptografia: ${msg.key?.id} ` +
-                      `(de: ${msg.key?.participant || msg.key?.remoteJid}, grupo: ${msg.key?.remoteJid?.includes('@g.us') ? msg.key?.remoteJid : 'N/A'})`,
-                  );
+                  const shouldLogDecryptionError = this.shouldLogDecryptionError(msg.key?.id);
+                  if (shouldLogDecryptionError) {
+                    this.logger.warn(
+                      `Mensagem filtrada devido a erro de descriptografia: ${msg.key?.id} ` +
+                        `(de: ${msg.key?.participant || msg.key?.remoteJid}, grupo: ${msg.key?.remoteJid?.includes('@g.us') ? msg.key?.remoteJid : 'N/A'})`,
+                    );
+                  }
 
                   // Log adicional para PreKey errors específicos
                   const preKeyError = msg?.messageStubParameters?.find?.((param) =>
                     param?.includes?.('Invalid PreKey ID'),
                   );
-                  if (preKeyError) {
-                    this.logger.error(
+                  if (preKeyError && shouldLogDecryptionError) {
+                    this.logger.warn(
                       `PreKeyError detectado - Contato: ${msg.key?.participant || msg.key?.remoteJid} ` +
                         `pode precisar reestabelecer sessão de criptografia`,
                     );
@@ -2883,7 +2915,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['groups.update']) {
               const payload = events['groups.update'];
-              this.groupHandler['groups.update'](payload);
+              await this.groupHandler['groups.update'](payload);
             }
 
             if (events['group-participants.update']) {
@@ -6313,6 +6345,32 @@ export class BaileysStartupService extends ChannelStartupService {
     // Foto não mudou
     this.logger.verbose(`ℹ️ Foto de perfil nao mudou para ${remoteJid}, ignorando evento`);
     return false;
+  }
+
+  private shouldLogDecryptionError(messageId?: string): boolean {
+    if (!messageId) {
+      return true;
+    }
+
+    const now = Date.now();
+    const LOG_TTL = 5 * 60 * 1000;
+    const lastLog = this.loggedDecryptionErrorIds.get(messageId);
+
+    if (lastLog && now - lastLog < LOG_TTL) {
+      return false;
+    }
+
+    this.loggedDecryptionErrorIds.set(messageId, now);
+
+    if (this.loggedDecryptionErrorIds.size > 500) {
+      for (const [id, timestamp] of this.loggedDecryptionErrorIds.entries()) {
+        if (now - timestamp > LOG_TTL) {
+          this.loggedDecryptionErrorIds.delete(id);
+        }
+      }
+    }
+
+    return true;
   }
 
   /**

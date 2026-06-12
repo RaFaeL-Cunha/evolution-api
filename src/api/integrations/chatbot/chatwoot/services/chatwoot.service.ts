@@ -621,6 +621,10 @@ export class ChatwootService {
 
       let data: any = {};
       if (!isGroup) {
+        const cleanPhoneNumber = phoneNumber?.split('@')[0]?.split(':')[0];
+        const isLidIdentifier = jid?.includes('@lid') || phoneNumber?.includes('@lid');
+        const hasRealPhoneNumber = cleanPhoneNumber && !isLidIdentifier;
+
         data = {
           inbox_id: inboxId,
           name: name || phoneNumber,
@@ -628,8 +632,8 @@ export class ChatwootService {
           avatar_url: avatar_url,
         };
 
-        if ((jid && jid.includes('@')) || !jid) {
-          data['phone_number'] = `+${phoneNumber}`;
+        if (hasRealPhoneNumber && ((jid && jid.includes('@')) || !jid)) {
+          data['phone_number'] = `+${cleanPhoneNumber}`;
         }
       } else {
         data = {
@@ -745,42 +749,44 @@ export class ChatwootService {
       return null;
     }
 
-    // Direct search by query (q) - most common way to search by identifier/email/phone
-    const contact = (await (client as any).get('contacts/search', {
-      params: {
-        q: identifier,
-        sort: 'name',
-      },
-    })) as any;
-
-    if (contact && contact.data && contact.data.payload && contact.data.payload.length > 0) {
-      return contact.data.payload[0];
-    }
-
-    // Fallback for older API versions or different response structures
-    if (contact && contact.payload && contact.payload.length > 0) {
-      return contact.payload[0];
-    }
-
-    // Try search by attribute
-    const contactByAttr = (await (client as any).post('contacts/filter', {
-      payload: [
-        {
-          attribute_key: 'identifier',
-          filter_operator: 'equal_to',
-          values: [identifier],
-          query_operator: null,
+    try {
+      const contactByAttr = (await chatwootRequest(this.getClientCwConfig(), {
+        method: 'POST',
+        url: `/api/v1/accounts/${this.provider.accountId}/contacts/filter`,
+        body: {
+          payload: [
+            {
+              attribute_key: 'identifier',
+              filter_operator: 'equal_to',
+              values: [identifier],
+              query_operator: null,
+            },
+          ],
         },
-      ],
-    })) as any;
+      })) as any;
 
-    if (contactByAttr && contactByAttr.payload && contactByAttr.payload.length > 0) {
-      return contactByAttr.payload[0];
+      const contacts = contactByAttr?.payload || contactByAttr?.data?.payload || [];
+      if (contacts.length > 0) {
+        return contacts[0];
+      }
+    } catch (error) {
+      this.logger.verbose(`Erro ao buscar contato por identifier, tentando busca geral: ${error.message}`);
     }
 
-    // Check inside data property if using axios interceptors wrapper
-    if (contactByAttr && contactByAttr.data && contactByAttr.data.payload && contactByAttr.data.payload.length > 0) {
-      return contactByAttr.data.payload[0];
+    try {
+      const contact = (await chatwootRequest(this.getClientCwConfig(), {
+        method: 'GET',
+        url: `/api/v1/accounts/${this.provider.accountId}/contacts/search?q=${encodeURIComponent(
+          identifier,
+        )}&sort=name`,
+      })) as any;
+
+      const contacts = contact?.payload || contact?.data?.payload || [];
+      if (contacts.length > 0) {
+        return contacts.find((contact) => contact.identifier === identifier) || contacts[0];
+      }
+    } catch (error) {
+      this.logger.verbose(`Erro ao buscar contato por query: ${error.message}`);
     }
 
     return null;
@@ -813,6 +819,12 @@ export class ChatwootService {
     let contact: any;
 
     if (isGroup) {
+      const contactByIdentifier = await this.findContactByIdentifier(instance, query);
+      if (contactByIdentifier) {
+        this.logger.verbose(`Contato de grupo encontrado por identifier: ${contactByIdentifier.id}`);
+        return contactByIdentifier;
+      }
+
       contact = await client.contacts.search({
         accountId: this.provider.accountId,
         q: query,
@@ -1007,6 +1019,46 @@ export class ChatwootService {
       return null;
     } catch (error) {
       this.logger.error(`Erro ao buscar conversação existente: ${error}`);
+      return null;
+    }
+  }
+
+  private async findContactByLinkedLid(instance: InstanceDto, phoneNumber: string) {
+    const phoneJid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`;
+
+    try {
+      const cached = await this.prismaRepository.isOnWhatsapp.findFirst({
+        where: {
+          OR: [{ remoteJid: phoneJid }, { jidOptions: { contains: phoneJid } }],
+        },
+      });
+
+      if (!cached) {
+        return null;
+      }
+
+      const lidJids = new Set<string>();
+      if (cached.remoteJid?.includes('@lid')) {
+        lidJids.add(cached.remoteJid);
+      }
+
+      cached.jidOptions
+        ?.split(',')
+        .map((jid: string) => jid.trim())
+        .filter((jid: string) => jid.includes('@lid'))
+        .forEach((jid: string) => lidJids.add(jid));
+
+      for (const lidJid of lidJids) {
+        const contact = await this.findContactByIdentifier(instance, lidJid);
+        if (contact) {
+          this.logger.log(`Contato JID ${phoneJid} encontrado via LID vinculado ${lidJid}: ${contact.id}`);
+          return contact;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      this.logger.warn(`Erro ao buscar contato por LID vinculado (${phoneJid}): ${error.message}`);
       return null;
     }
   }
@@ -1294,8 +1346,23 @@ export class ChatwootService {
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
-        this.logger.verbose(`Searching contact for: ${chatId}`);
-        let contact = await this.findContact(instance, chatId);
+        const contactLookup = !isGroup && !phoneNumber && isLidInRemoteJid ? remoteJid : chatId;
+        const contactIdentifier = !isGroup && !phoneNumber && isLidInRemoteJid ? remoteJid : phoneNumber;
+
+        this.logger.verbose(`Searching contact for: ${contactLookup}`);
+        let contact = await this.findContact(instance, contactLookup);
+
+        if (!contact && !isGroup && isLidInRemoteJid) {
+          contact = await this.findContactByIdentifier(instance, remoteJid);
+        }
+
+        if (!contact && !isGroup && isLidInRemoteJidAlt && body.key.remoteJidAlt) {
+          contact = await this.findContactByIdentifier(instance, body.key.remoteJidAlt);
+        }
+
+        if (!contact && !isGroup && phoneNumber && !isLidInRemoteJid) {
+          contact = await this.findContactByLinkedLid(instance, phoneNumber);
+        }
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
@@ -1307,7 +1374,7 @@ export class ChatwootService {
             isGroup,
             nameContact,
             picture_url.profilePictureUrl || null,
-            phoneNumber,
+            contactIdentifier,
           );
         }
 
@@ -4006,7 +4073,7 @@ export class ChatwootService {
 
             // Tenta buscar com cada JID até encontrar
             for (const jid of jidsToTry) {
-              const chatId = jid.split('@')[0].split(':')[0];
+              const chatId = jid.includes('@g.us') ? jid : jid.split('@')[0].split(':')[0];
               this.logger.log(`📸 Tentativa de busca com: ${chatId} (de ${jid})`);
 
               contact = await this.findContact(instance, chatId);
